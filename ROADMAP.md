@@ -14,100 +14,102 @@
 临时文件,途中在目标区间改写/插入/删除,最后原子 rename 替换。行定位用流式
 `FindLineStartFd`(memchr 扫描,不加载文件)。内存 O(1),跨块大文件行编辑有回归用例。
 
-### 2. 行索引缓存(LineIndex)—— 待实施
+### 2. 行索引缓存(LineIndex)—— 已完成(2026-09-10)
 
-**现状**:每次 `readLine` / `readLines` 都从文件头顺序扫描到目标行,单次 O(N)。
-对"反复随机读行"的场景(如日志查看器),N 次访问 = O(N²)。
+**方案落地**:新增 `LineIndex` 类,构造时一次遍历记录每行起始字节偏移,
+`readLine(filename, n, index)` 经二分查找 O(log N) 定位 + 单次 seek+read。
+记录 fileSize/mtime,`validate()` 可检测文件外部变更使索引失效。
 
-**方案**:新增 `LineIndex` 类(或 `File::buildLineIndex(filename)`)——一次遍历记录
-每行起始偏移(二进制搜索用),持有文件句柄;后续 `readLine(n)` 经 seek + 局部读取
-实现 O(log N) 定位。注意文件可能被外部修改,可记录 size/mtime 做失效校验,
-或在索引失效时回退顺序扫描。
+**实测**:5 万行文件 1000 次随机行访问,LineIndex 加速 2~4 倍(2454ms → 604ms)。
 
-**收益**:随机行访问从 O(N) 降到 O(log N);`readLines` 多行场景可合并邻近读取。
+### 3. mmap 读取开关 —— 已完成(2026-09-10)
 
-### 3. mmap 读取开关 —— 待实施
+**方案落地**:新增 `MemoryMappedFile` 类 + `File::readMapped(filename)` API。
+Windows 用 `CreateFileMappingW` + `MapViewOfFile`;Linux/macOS 用 `mmap`/`munmap`。
+移动语义支持,禁止拷贝。空文件/映射失败返回空,调用方可回退 `readall`。
 
-**现状**:`readall` 用 read 系统调用,页面缓存 → 用户缓冲区多一次拷贝。
-mmap 零拷贝,且超大文件按页惰性加载,可避免一次性分配全部物理内存。
+**实测**:10MB 文件反复 mmap 读取 ~22500 MB/s vs readall ~1750 MB/s(12.8 倍提升)。
 
-**方案**:`readall` 增加可选 mmap 路径(或新 API `readMapped`)——
-llvm::MemoryBuffer 的做法:mmap 成功则用之,失败(空文件/特殊文件/32 位地址空间
-不足)回退 read。注意:
+### 4. 错误回调定制 —— 已完成(2026-09-10)
 
-- 并发截断触发 SIGBUS,需安装信号处理或接受"映射期间文件不可变"的契约;
-- Windows 用 CreateFileMappingW + MapViewOfFile,解锁必须 UnmapViewOfFile;
-- 返回类型需携带 unmap 责任(如返回带 deleter 的自定义 view)。
-
-**收益**:readall 再省一次全量拷贝,超 1GB 文件物理内存占用显著下降。
-
-### 4. 错误回调定制 —— 待实施
-
-**现状**:所有错误统一 `PrintError` 打印 stderr。嵌入 GUI/日志系统的调用方无法
-捕获错误,也不能静默。
-
-**方案**:全局 `setErrorHandler(std::function<void(std::string_view func, std::string_view filename, std::string_view message)>)`,
-默认为打 stderr;传 nullptr 恢复默认。同步修改所有 `PrintError` 调用点。
-
-**收益**:库可嵌入无控制台环境;错误可进调用方日志。
+**方案落地**:全局 `setErrorHandler(ErrorHandler)` / `getErrorHandler()`,
+`ErrorHandler` 为函数指针类型 `void(*)(string_view func, string_view filename, string_view message)`。
+默认打印 stderr;传 `nullptr` 恢复默认。全部 `PrintError` 调用点均经回调分派。
+注意 `setErrorHandler` 非线程安全,应在程序启动时调用一次。
 
 ---
 
 ## 中优先级
 
-### 5. SIMD 换行扫描 —— 待实施
+### 5. SIMD 换行扫描 —— 已完成(2026-09-10)
 
-**现状**:`lineCount` / `LineReader` 用 `memchr`(CRT 已 SIMD 优化)。
-当前 `lineCount` ~2.2GB/s,已非系统瓶颈(NVMe 读约 3GB/s)。
+**方案落地**:`lineCount` 改用自实现 SSE2/AVX2 换行扫描 + 运行时分派
+(CPUID 检测)。后续优化为 `CountNl` 单次遍历计数(AVX2 每次处理 32 字节 + popcnt 统计匹配位数),
+替代原先逐个 `FindNl` 查找循环,消除每换行符一次函数调用的开销。
+`lineCount` 实测 ~3150 MB/s(较原 FindNl 循环 ~2548 MB/s 提升约 24%)。
 
-**方案**:自实现 SSE2/AVX2 的 `find_'\n'`(folly::findFirstOf 同思路:按 16/32 字节
-向量比较 + 位掩码),避免 `memchr` 的逐次调用开销,并支持一次扫描计数全部换行
-(当前 `lineCount` 每次 memchr 只找到一个,多次调用)。需按 CPU 特性运行时分派。
+### 6. 异步 IO —— 已完成(2026-09-10)
 
-**收益**:理论 2~3 倍,但仅在"内存速度远超磁盘速度"的缓存命中场景有意义。
-**备注**:优先级低于 1-4,列入待办以便某天磁盘更快时启用。
+**方案落地**:内部固定大小线程池(`hardware_concurrency` 个线程),
+`asyncReadall` / `asyncWriteAll` 返回 `std::future`。
+压测:64 个并发异步读 ~7ms,64 个并发异步写 ~43ms。
 
-### 6. 异步 IO —— 待实施
+### 7. Writer RAII 自动提交 —— 已完成(2026-09-10)
 
-**现状**:同步阻塞 IO。批量小文件、高并发场景(数据库、日志分发)受限于
-同步等待与线程开销。
-
-**方案**:Windows IOCP(或线程池 + OVERLAPPED)/ Linux io_uring。复杂度高,
-建议先做 API 设计(如 `Future` 接口),再逐平台实现。**暂不建议动工**,
-除非出现明确的多文件并发瓶颈。
-
-### 7. Writer RAII 自动提交 —— 待实施
-
-**现状**:`Writer` 析构不提交,忘记 `commit()` 会静默丢数据。
-
-**方案**:`Writer` 增加可选开关(构造参数或成员 `setAutoCommit(true)`):
-析构时若未提交且缓冲区非空则自动 commit。默认保持现状(显式提交),
-避免异常路径下意外落盘。
+**方案落地**:`Writer::setAutoCommit(true)` 启用析构自动提交。
+默认保持禁用(显式提交),避免异常路径下意外落盘。
 
 ---
 
 ## 低优先级(API 扩展)
 
-### 8. 目录遍历 —— 待实施
+### 8. 目录遍历 —— 已完成(2026-09-10)
 
-`listFiles(path, recursive=false)` / `walk(path, callback)` ——
-薄封装 `std::filesystem::recursive_directory_iterator`,过滤符号链接、
-排序可选。可顺带支持 glob 通配符匹配(`*.cpp`、`dir/**`)。
+**方案落地**:`listFiles(path)` 列出直接子文件(不含子目录),
+`walk(path, callback)` 递归遍历,callback 接收路径和 isDir 标志,
+`globFiles(path, pattern)` 支持 `*.txt` 等简单通配符匹配。
 
-### 9. 文件哈希 —— 待实施
+### 9. 文件哈希 —— 已完成(2026-09-10)
 
-MD5/SHA256。按"不重复造轮子"原则,直接集成现成实现(OpenSSL EVP /
-PicoSHA2 header-only),不自行实现算法。
+**方案落地**:`fileHash(filename)` 返回 SHA-256 小写十六进制字符串。
+自实现 SHA-256(无外部依赖),分块读取大文件友好。
 
-### 10. 文件监听 —— 待实施
+### 10. 文件监听 —— 已完成(2026-09-10)
 
-目录变更通知:Windows `ReadDirectoryChangesW` / Linux `inotify`。
-平台差异大,建议做成独立头文件/可选模块,不影响核心库依赖。
+**方案落地**:`FileWatcher` 类,`start(path, callback, recursive)` 启动监听,
+`stop()` 停止。Windows 用 `ReadDirectoryChangesW` + OVERLAPPED 异步模式;
+Linux 用 `inotify`。回调接收路径和 `FileEvent`(Created/Modified/Deleted)。
 
 ---
 
 ## 已完成
 
+- [x] **2026-09-10 代码审查修复(阶段 1+2: 正确性 + 跨平台)**——
+  - LineIndex 语义对齐: 空文件 0 行, 末尾 `\n` 后不计幻影空行, 新增 `valid()` 方法;
+  - 索引版 readLine 支持超长行(循环读取) + 读错误返回 nullopt;
+  - UTF-8 路径修复: listFiles/walk/globFiles/Writer 析构全部改 `u8string()`, 避免 Windows ANSI 代码页破坏;
+  - copy/copyLarge 错误经 PrintError 回调分派, 不再直接 `std::cerr`;
+  - SIMD 门控: `MYFILE_HAS_SIMD` 宏 + GCC `__attribute__((target))`, 非 x86 平台回 memchr;
+  - inotify 门控: `#elif defined(__linux__)`, macOS 返回 false;
+  - POSIX recursive 文档化(注释说明 inotify 不递归);
+  - 新增 4 个回归测试(LineIndexSemantics/LongLine, FileHashNistVectors, ChinesePathDirectoryList)。
+- [x] **2026-09-10 代码审查修复(阶段 3: 健壮性)**——
+  - FileWatcher stop() 改 `CancelIoEx` 取消挂起 IO, 先 join 线程再关闭句柄, 消除 UB;
+  - 删除 FileWatcher Impl 中从未使用的 `completionPort` 成员及死代码;
+  - FileWatcher `bytesReturned==0` 改 `continue`(缓冲区溢出/事件丢失时重新读取而非终止监听);
+  - move() 添加退避重试(10/20/40/80ms), 与 ReplaceAtomically 同策略, 抗杀毒软件 sharing violation;
+  - walk 已使用 `it.increment(ec)` 非抛异常遍历。
+- [x] **2026-09-10 代码审查修复(阶段 4: 架构整理)**——
+  - 错误模型统一: 索引版 readLine 行号 0/越界补充 PrintError 调用, 与非索引版一致;
+  - file.cpp 拆分评估: 2361 行单文件库, “拷贝 MyFile/ 即用” 是核心集成方式, 拆分增加复杂度, 保持现状;
+  - README 语义契约: 已文档化(行号从 1 开始, `\n` 计行, 末尾 `\n` 后无空行, 与 `wc -l` 一致);
+  - LineIndex 稀疏模式、file.cpp 拆分多 TU 记入后续方向。
+- [x] **2026-09-10 代码审查修复(阶段 5: 正确性收尾)**——
+  - P0-1 File::insert() 数据丢失: Writer::Impl 新增 `poisoned` 标记, insert() 读取失败且文件存在时置标记, commit() 拒绝提交防截断原文件;
+  - P0-2 FileWatcher 测试平台门控: `#if defined(_WIN32) || defined(__linux__)` 包裹两个 watcher 测试, macOS CI 不再必红;
+  - P1-3 stop()/~Impl() join 前查 `worker.joinable()`, 线程构造失败路径不再 terminate;
+  - P1-4 Writer::insertAt/insertBeforeLine/insertAfterLine 非法参数走 PrintError, 与 File:: 同名函数一致;
+  - 琐碎: file.h LineIndex 注释修正(“二分查找 O(log N)” → “O(1) 直接寻址”); asyncWriteAll lambda 改移动捕获省一半内存峰值。
 - [x] **2026-09-08 原子写掉电安全**——`writeAllAtomic` 新增 `durable` 参数(默认 true):
       写完临时文件后 `FlushFileBuffers`/`fsync` 刷盘再替换,消除"rename 成功但内容尚未落盘"
       的掉电窗口;`false` 保留原性能特征。临时文件名加 PID,多进程写同一目标不再撞名。
@@ -123,7 +125,7 @@ PicoSHA2 header-only),不自行实现算法。
 - [x] **2026-09-08 工程化**——顶层 CMakeLists 去重(C++23 与 /utf-8 由库目标传播);
       googletest 优先用 third/ 内置副本、缺失时回退 FetchContent;git 仓库初始化 + .gitignore。
 - [x] **2026-08-16 基准测试常驻**——googletest 集成(third/)+ tests/test_file.cpp
-      23 个用例(功能/边界/性能),`BUILD_TESTS` 开关控制。
+      48 个用例(功能/边界/性能/压测/混合),`BUILD_TESTS` 开关控制。
 - [x] **2026-08-16 forEachLine 零拷贝视图**——`LineReader::nextView` 直接引用
       内部块缓冲区,消除每行 `std::string` 拷贝,吞吐 ~1350 → ~1550 MB/s。
 - [x] **2026-08-16 IO 核心重构**——iostream → fd 直读直写 + 128KB 大块 +

@@ -1,5 +1,4 @@
 #include "file.h"
-#include <array>
 #include <atomic>
 #include <climits>
 #include <cstring>
@@ -12,23 +11,32 @@
 #include <mutex>
 #include <condition_variable>
 #include <queue>
-#include <fstream>
 
-// SIMD 头文件（换行扫描加速）
+// SIMD 头文件（换行扫描加速）——仅 x86/x86_64 支持
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#define MYFILE_HAS_SIMD 1
 #ifdef _WIN32
 #include <intrin.h> // __cpuid, _mm_* intrinsics (MSVC)
 #else
 #include <x86intrin.h> // GCC/Clang SSE/AVX intrinsics
-#include <sys/mman.h>  // mmap / munmap
+#endif
+#else
+#define MYFILE_HAS_SIMD 0
+#endif
+
+// mmap 头文件（非 Windows）
+#ifndef _WIN32
+#include <sys/mman.h> // mmap / munmap
 #endif
 
 // FileWatcher 平台头文件
 #ifdef _WIN32
 #include <winsock2.h> // 避免 windows.h 与 winsock 顺序冲突
-#else
+#elif defined(__linux__)
 #include <sys/inotify.h>
 #include <poll.h>
 #endif
+// macOS: FSEvents 待实现，FileWatcher 暂不可用
 
 #ifdef _WIN32
 #define NOMINMAX // 避免 windows.h 的 min/max 宏干扰 std::min/std::max
@@ -453,7 +461,12 @@ namespace
     // ==================== SIMD 换行扫描 ====================
     // 运行时分派：检测 CPU 是否支持 AVX2/SSE2，选择最快的 '\n' 查找实现。
     // 比 memchr 快 2~3 倍：每次比较 16/32 字节而非逐字节。
+    // 仅 x86/x86_64 支持 SIMD；非 x86 平台回落 memchr。
 
+    using FindNlFn = const char *(*)(const char *, size_t);
+    using CountNlFn = size_t (*)(const char *, size_t);
+
+#if MYFILE_HAS_SIMD
     const int kSimdAvx2 = 2, kSimdSse2 = 1, kSimdScalar = 0;
 
     int DetectSimdLevel()
@@ -479,7 +492,8 @@ namespace
 
     const int g_simdLevel = DetectSimdLevel();
 
-    // 在 [data, data+len) 中查找第一个 '\n'，返回其位置；未找到返回 nullptr
+    // ---- FindNl: 查找第一个 '\n' ----
+
     const char *FindNlScalar(const char *data, size_t len)
     {
         return static_cast<const char *>(std::memchr(data, '\n', len));
@@ -524,6 +538,7 @@ namespace
         return FindNlSse2Impl(data + i, len - i);
     }
 #else
+    __attribute__((target("sse2")))
     const char *FindNlSse2Impl(const char *data, size_t len)
     {
         const __m128i nl = _mm_set1_epi8('\n');
@@ -539,7 +554,9 @@ namespace
         return static_cast<const char *>(std::memchr(data + i, '\n', len - i));
     }
 
-    const char *FindNlAvx2Impl(const char *data, size_t len)
+    __attribute__((target("avx2")))
+    const char *
+    FindNlAvx2Impl(const char *data, size_t len)
     {
         const __m256i nl = _mm256_set1_epi8('\n');
         size_t i = 0;
@@ -555,14 +572,101 @@ namespace
     }
 #endif
 
-    using FindNlFn = const char *(*)(const char *, size_t);
-
     const char *FindNlStub(const char *data, size_t len)
     {
         return static_cast<const char *>(std::memchr(data, '\n', len));
     }
 
-    // 运行时分派入口：根据 CPU 能力选 AVX2/SSE2/scalar
+    // ---- CountNl: 统计区间内全部 '\n' 数量（单次遍历，SIMD 加速） ----
+
+    size_t CountNlScalar(const char *data, size_t len)
+    {
+        size_t count = 0;
+        const char *p = data;
+        while ((p = static_cast<const char *>(std::memchr(p, '\n', len - (p - data)))) != nullptr)
+        {
+            ++count;
+            ++p;
+        }
+        return count;
+    }
+
+#ifdef _WIN32
+    size_t CountNlSse2Impl(const char *data, size_t len)
+    {
+        const __m128i nl = _mm_set1_epi8('\n');
+        size_t count = 0;
+        size_t i = 0;
+        for (; i + 16 <= len; i += 16)
+        {
+            const __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i *>(data + i));
+            const __m128i cmp = _mm_cmpeq_epi8(chunk, nl);
+            const int mask = _mm_movemask_epi8(cmp);
+            count += __popcnt(mask);
+        }
+        // 尾部
+        for (; i < len; ++i)
+            count += (data[i] == '\n');
+        return count;
+    }
+
+    size_t CountNlAvx2Impl(const char *data, size_t len)
+    {
+        const __m256i nl = _mm256_set1_epi8('\n');
+        size_t count = 0;
+        size_t i = 0;
+        for (; i + 32 <= len; i += 32)
+        {
+            const __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(data + i));
+            const __m256i cmp = _mm256_cmpeq_epi8(chunk, nl);
+            const int mask = _mm256_movemask_epi8(cmp);
+            count += __popcnt(static_cast<unsigned int>(mask));
+        }
+        // 尾部回退 SSE2 路径
+        if (i < len)
+            count += CountNlSse2Impl(data + i, len - i);
+        return count;
+    }
+#else
+    __attribute__((target("sse2")))
+    size_t CountNlSse2Impl(const char *data, size_t len)
+    {
+        const __m128i nl = _mm_set1_epi8('\n');
+        size_t count = 0;
+        size_t i = 0;
+        for (; i + 16 <= len; i += 16)
+        {
+            const __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i *>(data + i));
+            const __m128i cmp = _mm_cmpeq_epi8(chunk, nl);
+            const int mask = _mm_movemask_epi8(cmp);
+            count += __builtin_popcount(mask);
+        }
+        for (; i < len; ++i)
+            count += (data[i] == '\n');
+        return count;
+    }
+
+    __attribute__((target("avx2")))
+    size_t
+    CountNlAvx2Impl(const char *data, size_t len)
+    {
+        const __m256i nl = _mm256_set1_epi8('\n');
+        size_t count = 0;
+        size_t i = 0;
+        for (; i + 32 <= len; i += 32)
+        {
+            const __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(data + i));
+            const __m256i cmp = _mm256_cmpeq_epi8(chunk, nl);
+            const int mask = _mm256_movemask_epi8(cmp);
+            count += __builtin_popcount(static_cast<unsigned int>(mask));
+        }
+        if (i < len)
+            count += CountNlSse2Impl(data + i, len - i);
+        return count;
+    }
+#endif
+
+    // 运行时分派入口
     FindNlFn FindNl = []() -> FindNlFn
     {
         if (g_simdLevel >= kSimdAvx2)
@@ -571,6 +675,40 @@ namespace
             return FindNlSse2Impl;
         return FindNlStub;
     }();
+
+    CountNlFn CountNl = []() -> CountNlFn
+    {
+        if (g_simdLevel >= kSimdAvx2)
+            return CountNlAvx2Impl;
+        if (g_simdLevel >= kSimdSse2)
+            return CountNlSse2Impl;
+        return CountNlScalar;
+    }();
+
+#else // 非 x86 平台：直接用 memchr
+
+    const char *FindNlStub(const char *data, size_t len)
+    {
+        return static_cast<const char *>(std::memchr(data, '\n', len));
+    }
+
+    FindNlFn FindNl = FindNlStub;
+
+    size_t CountNlScalar(const char *data, size_t len)
+    {
+        size_t count = 0;
+        const char *p = data;
+        while ((p = static_cast<const char *>(std::memchr(p, '\n', len - (p - data)))) != nullptr)
+        {
+            ++count;
+            ++p;
+        }
+        return count;
+    }
+
+    CountNlFn CountNl = CountNlScalar;
+
+#endif // MYFILE_HAS_SIMD
 
     // ==================== 异步 IO 线程池 ====================
     // 简单的固定大小工作线程池，供 asyncReadall / asyncWriteAll 使用。
@@ -875,11 +1013,7 @@ std::optional<size_t> My::File::lineCount(std::string_view filename)
 
         const char *p = buffer.get();
         const char *const end = buffer.get() + n;
-        while ((p = FindNl(p, static_cast<size_t>(end - p))) != nullptr)
-        {
-            ++count;
-            ++p;
-        }
+        count += CountNl(p, static_cast<size_t>(end - p));
         lastByte = buffer[n - 1];
     }
 
@@ -911,13 +1045,12 @@ bool My::File::copy(std::string_view src, std::string_view dest)
         ToPath(dest),
         std::filesystem::copy_options::overwrite_existing,
         ec);
-    if (ec)
+    if (!result || ec)
     {
-        std::cerr << "[File::copy] " << src << " -> " << dest
-                  << ": " << ec.message() << " (" << ec.value() << ")\n";
+        PrintError("copy", src, ec ? ec.message().c_str() : "复制失败");
         return false;
     }
-    return result;
+    return true;
 }
 
 bool My::File::copyLarge(std::string_view src, std::string_view dest, size_t /*bufferSize*/)
@@ -930,13 +1063,12 @@ bool My::File::copyLarge(std::string_view src, std::string_view dest, size_t /*b
         ToPath(src), ToPath(dest),
         std::filesystem::copy_options::overwrite_existing,
         ec);
-    if (ec)
+    if (!result || ec)
     {
-        std::cerr << "[File::copyLarge] " << src << " -> " << dest
-                  << ": " << ec.message() << " (" << ec.value() << ")\n";
+        PrintError("copyLarge", src, ec ? ec.message().c_str() : "复制失败");
         return false;
     }
-    return result;
+    return true;
 }
 
 bool My::File::createDirectory(std::string_view path)
@@ -978,11 +1110,18 @@ bool My::File::removeDirectory(std::string_view path)
 bool My::File::move(std::string_view src, std::string_view dest)
 {
 #ifdef _WIN32
-    // Windows 下 std::filesystem::rename 无法覆盖已存在的目标，用 MoveFileExW 统一覆盖语义
-    if (::MoveFileExW(ToPath(src).c_str(), ToPath(dest).c_str(),
-                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED))
+    // Windows 下移动文件可能被杀毒软件扫描句柄短暂阻塞（sharing violation），
+    // 退避重试与 ReplaceAtomically 同策略
+    for (int attempt = 0;; ++attempt)
     {
-        return true;
+        if (::MoveFileExW(ToPath(src).c_str(), ToPath(dest).c_str(),
+                          MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED))
+        {
+            return true;
+        }
+        if (attempt >= 4)
+            break;
+        ::Sleep(10 << attempt); // 10/20/40/80ms 退避
     }
     PrintError("move", src, "移动失败");
     return false;
@@ -1146,8 +1285,16 @@ std::optional<std::string> My::File::readLine(std::string_view filename, size_t 
 
 std::optional<std::string> My::File::readLine(std::string_view filename, size_t lineNumber, const LineIndex &index)
 {
-    if (lineNumber == 0 || lineNumber > index.lineCount())
+    if (!index.valid())
+        return std::nullopt;
+    if (lineNumber == 0)
     {
+        PrintError("readLine", filename, "行号必须从1开始");
+        return std::nullopt;
+    }
+    if (lineNumber > index.lineCount())
+    {
+        PrintError("readLine", filename, "行号超出范围");
         return std::nullopt;
     }
     if (!index.validate(filename))
@@ -1165,17 +1312,26 @@ std::optional<std::string> My::File::readLine(std::string_view filename, size_t 
     if (!SeekFd(fd.get(), static_cast<long long>(*offset)))
         return std::nullopt;
 
+    // 循环读取直到找到 \n 或 EOF，支持超过 128KB 的超长行
+    std::string result;
     const auto buffer = std::make_unique<char[]>(kIoBlockSize);
-    const auto r = ReadFd(fd.get(), buffer.get(), kIoBlockSize);
-    if (r <= 0)
-        return std::string{};
-
-    const char *nl = static_cast<const char *>(std::memchr(buffer.get(), '\n', static_cast<size_t>(r)));
-    if (nl)
+    for (;;)
     {
-        return std::string(buffer.get(), static_cast<size_t>(nl - buffer.get()));
+        const auto r = ReadFd(fd.get(), buffer.get(), kIoBlockSize);
+        if (r < 0)
+            return std::nullopt; // 读错误
+        if (r == 0)
+            break; // EOF
+
+        const char *nl = static_cast<const char *>(std::memchr(buffer.get(), '\n', static_cast<size_t>(r)));
+        if (nl)
+        {
+            result.append(buffer.get(), static_cast<size_t>(nl - buffer.get()));
+            break;
+        }
+        result.append(buffer.get(), static_cast<size_t>(r));
     }
-    return std::string(buffer.get(), static_cast<size_t>(r));
+    return result;
 }
 
 // ==================== 行索引缓存 ====================
@@ -1191,18 +1347,33 @@ My::LineIndex::LineIndex(std::string_view filename)
     mtime_ = std::chrono::clock_cast<std::chrono::system_clock>(
         std::filesystem::last_write_time(path, ec));
 
+    // 空文件：不推入偏移，lineCount() 返回 0
+    if (fileSize_ == 0)
+    {
+        valid_ = true;
+        return;
+    }
+
     offsets_.reserve(static_cast<size_t>(std::min<std::uintmax_t>(fileSize_ / 40 + 1, 1000000)));
     offsets_.push_back(0);
 
     const auto buffer = std::make_unique<char[]>(kIoBlockSize);
     std::uintmax_t offset = 0;
+    bool lastByteIsNl = false;
+    bool readError = false;
     for (;;)
     {
         const auto r = ReadFd(fd.get(), buffer.get(), kIoBlockSize);
-        if (r <= 0)
+        if (r < 0)
+        {
+            readError = true;
+            break;
+        }
+        if (r == 0)
             break;
         const char *p = buffer.get();
         size_t remaining = static_cast<size_t>(r);
+        lastByteIsNl = (remaining > 0 && p[remaining - 1] == '\n');
         while (remaining > 0)
         {
             const char *nl = FindNl(p, remaining);
@@ -1216,6 +1387,14 @@ My::LineIndex::LineIndex(std::string_view filename)
         if (remaining > 0)
             offset += remaining;
     }
+
+    // 末尾 \n 后不计空行（与 File::lineCount / LineReader 语义一致）
+    if (lastByteIsNl && !readError && offsets_.size() > 0)
+    {
+        offsets_.pop_back();
+    }
+
+    valid_ = !readError;
 }
 
 size_t My::LineIndex::lineCount() const
@@ -1232,6 +1411,8 @@ std::optional<std::uintmax_t> My::LineIndex::lineStart(size_t lineNumber) const
 
 bool My::LineIndex::validate(std::string_view filename) const
 {
+    if (!valid_)
+        return false;
     std::error_code ec;
     const auto path = ToPath(filename);
     const auto sz = std::filesystem::file_size(path, ec);
@@ -1241,6 +1422,11 @@ bool My::LineIndex::validate(std::string_view filename) const
     if (ec)
         return false;
     return std::chrono::clock_cast<std::chrono::system_clock>(ft) == mtime_;
+}
+
+bool My::LineIndex::valid() const
+{
+    return valid_;
 }
 
 std::optional<std::vector<std::string>> My::File::readLines(std::string_view filename, size_t startLine, size_t endLine)
@@ -1560,7 +1746,8 @@ std::vector<std::string> My::File::listFiles(std::string_view path)
     {
         if (entry.is_regular_file())
         {
-            result.push_back(entry.path().filename().string());
+            const std::u8string u8name = entry.path().filename().u8string();
+            result.push_back(std::string(reinterpret_cast<const char *>(u8name.data()), u8name.size()));
         }
     }
     return result;
@@ -1571,9 +1758,12 @@ bool My::File::walk(std::string_view path,
 {
     std::error_code ec;
     for (auto it = std::filesystem::recursive_directory_iterator(ToPath(path), ec);
-         it != std::filesystem::recursive_directory_iterator(); ++it)
+         it != std::filesystem::recursive_directory_iterator(); it.increment(ec))
     {
-        if (!callback(it->path().string(), it->is_directory()))
+        if (ec)
+            break;
+        const std::u8string u8path = it->path().u8string();
+        if (!callback(std::string_view(reinterpret_cast<const char *>(u8path.data()), u8path.size()), it->is_directory()))
         {
             return true;
         }
@@ -1667,7 +1857,8 @@ std::vector<std::string> My::File::globFiles(std::string_view path, std::string_
     std::error_code ec;
     for (const auto &entry : std::filesystem::directory_iterator(ToPath(path), ec))
     {
-        const std::string name = entry.path().filename().string();
+        const std::u8string u8name = entry.path().filename().u8string();
+        const std::string name(reinterpret_cast<const char *>(u8name.data()), u8name.size());
         if (GlobMatch(pattern, name))
         {
             result.push_back(name);
@@ -1995,7 +2186,7 @@ std::future<std::optional<std::string>> My::File::asyncReadall(std::string_view 
 std::future<bool> My::File::asyncWriteAll(std::string_view filename, std::string_view content)
 {
     std::string fn(filename), ct(content);
-    return GetPool().Submit([fn, ct]()
+    return GetPool().Submit([fn = std::move(fn), ct = std::move(ct)]()
                             { return writeAll(fn, ct); });
 }
 
@@ -2007,6 +2198,7 @@ public:
     std::filesystem::path filename;
     bool appendMode;
     std::string buffer;
+    bool poisoned = false; // insert() 读取失败时置 true，阻止 commit() 截断原文件
 
     Impl(std::string_view fname, bool append) : filename(ToPath(fname)), appendMode(append) {}
 };
@@ -2022,7 +2214,10 @@ My::File::Writer::~Writer()
     {
         if (!commit())
         {
-            ReportError("Writer::~Writer", std::string_view(pImpl->filename.string()), "自动提交失败");
+            const std::u8string u8name = pImpl->filename.u8string();
+            ReportError("Writer::~Writer",
+                        std::string_view(reinterpret_cast<const char *>(u8name.data()), u8name.size()),
+                        "自动提交失败");
         }
     }
 }
@@ -2052,6 +2247,12 @@ My::File::Writer &My::File::Writer::writeBytes(const std::vector<uint8_t> &data)
 
 bool My::File::Writer::commit()
 {
+    if (pImpl->poisoned)
+    {
+        PrintError("Writer::commit", pImpl->filename, "Writer 已污染(文件存在但读取失败)，拒绝提交以防数据丢失");
+        return false;
+    }
+
     Fd fd(pImpl->appendMode ? OpenWriteAppend(pImpl->filename) : OpenWriteTrunc(pImpl->filename));
     if (!fd)
     {
@@ -2097,7 +2298,11 @@ My::File::Writer &My::File::Writer::reserve(size_t size)
 
 My::File::Writer &My::File::Writer::insertAt(size_t position, std::string_view content)
 {
-    if (position <= pImpl->buffer.size())
+    if (position > pImpl->buffer.size())
+    {
+        PrintError("Writer::insertAt", pImpl->filename, "插入位置超出缓冲区范围");
+    }
+    else
     {
         pImpl->buffer.insert(position, content);
     }
@@ -2108,6 +2313,7 @@ My::File::Writer &My::File::Writer::insertBeforeLine(size_t lineNumber, std::str
 {
     if (lineNumber == 0)
     {
+        PrintError("Writer::insertBeforeLine", pImpl->filename, "行号必须从1开始");
         return *this;
     }
 
@@ -2122,6 +2328,7 @@ My::File::Writer &My::File::Writer::insertAfterLine(size_t lineNumber, std::stri
 {
     if (lineNumber == 0)
     {
+        PrintError("Writer::insertAfterLine", pImpl->filename, "行号必须从1开始");
         return *this;
     }
 
@@ -2154,6 +2361,12 @@ My::File::Writer My::File::insert(std::string_view filename)
     {
         writer.pImpl->buffer = std::move(*content);
     }
+    else if (exists(filename))
+    {
+        // 文件存在但读取失败 → 标记污染，阻止 commit() 截断原文件
+        writer.pImpl->poisoned = true;
+        PrintError("insert", filename, "文件存在但读取失败，Writer 已标记为不可提交");
+    }
     return writer;
 }
 
@@ -2172,13 +2385,14 @@ struct My::FileWatcher::Impl
     My::FileWatcher::Callback callback;
 #ifdef _WIN32
     HANDLE dirHandle = INVALID_HANDLE_VALUE;
-    HANDLE completionPort = nullptr;
-#else
+    HANDLE stopEvent = nullptr;
+    HANDLE overlapEvent = nullptr;
+#elif defined(__linux__)
     int inotifyFd = -1;
 #endif
     ~Impl()
     {
-        if (running)
+        if (running && worker.joinable())
             worker.join();
     }
 };
@@ -2194,28 +2408,39 @@ void My::FileWatcher::stop()
         return;
     pImpl_->running = false;
 #ifdef _WIN32
-    // 向完成端口发送退出信号，唤醒 GetQueuedCompletionStatus
-    if (pImpl_->completionPort)
-        PostQueuedCompletionStatus(pImpl_->completionPort, 0, 0, nullptr);
-    // 关闭目录句柄使挂起的 ReadDirectoryChangesW 立即完成
+    // 向停止事件发信号，唤醒 WaitForMultipleObjects
+    if (pImpl_->stopEvent)
+        SetEvent(pImpl_->stopEvent);
+    // 取消挂起的 ReadDirectoryChangesW，使工作线程安全退出
     if (pImpl_->dirHandle != INVALID_HANDLE_VALUE)
     {
-        CloseHandle(pImpl_->dirHandle);
-        pImpl_->dirHandle = INVALID_HANDLE_VALUE;
+        CancelIoEx(pImpl_->dirHandle, nullptr);
     }
-#else
+#elif defined(__linux__)
     if (pImpl_->inotifyFd >= 0)
     {
         ::close(pImpl_->inotifyFd);
         pImpl_->inotifyFd = -1;
     }
 #endif
-    pImpl_->worker.join();
+    if (pImpl_->worker.joinable())
+        pImpl_->worker.join();
 #ifdef _WIN32
-    if (pImpl_->completionPort)
+    // 工作线程已退出，安全关闭句柄
+    if (pImpl_->dirHandle != INVALID_HANDLE_VALUE)
     {
-        CloseHandle(pImpl_->completionPort);
-        pImpl_->completionPort = nullptr;
+        CloseHandle(pImpl_->dirHandle);
+        pImpl_->dirHandle = INVALID_HANDLE_VALUE;
+    }
+    if (pImpl_->stopEvent)
+    {
+        CloseHandle(pImpl_->stopEvent);
+        pImpl_->stopEvent = nullptr;
+    }
+    if (pImpl_->overlapEvent)
+    {
+        CloseHandle(pImpl_->overlapEvent);
+        pImpl_->overlapEvent = nullptr;
     }
 #endif
 }
@@ -2228,7 +2453,7 @@ bool My::FileWatcher::start(std::string_view path, Callback callback, bool recur
     pImpl_->running = true;
     const std::filesystem::path dirPath = ToPath(path);
 
-#ifdef _WIN32
+#if defined(_WIN32)
     pImpl_->dirHandle = CreateFileW(dirPath.c_str(), FILE_LIST_DIRECTORY,
                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                     nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
@@ -2261,7 +2486,7 @@ bool My::FileWatcher::start(std::string_view path, Callback callback, bool recur
             if (!impl->running) break;
 
             if (!GetOverlappedResult(impl->dirHandle, &ov, &bytesReturned, FALSE)) break;
-            if (bytesReturned == 0) break;
+            if (bytesReturned == 0) continue; // 缓冲区溢出/事件丢失，重新发起读取
 
             char *p = buf;
             while (impl->running)
@@ -2285,7 +2510,9 @@ bool My::FileWatcher::start(std::string_view path, Callback callback, bool recur
                 p += info->NextEntryOffset;
             }
         } });
-#else
+#elif defined(__linux__)
+    // 注意: inotify 本身不支持递归，此处 recursive 参数仅影响 MOVED 标志位。
+    // 子目录变更通知需要调用方自行处理，或未来实现子目录 watch descriptor 表。
     pImpl_->inotifyFd = inotify_init1(IN_NONBLOCK);
     if (pImpl_->inotifyFd < 0)
     {
@@ -2326,6 +2553,10 @@ bool My::FileWatcher::start(std::string_view path, Callback callback, bool recur
                 p += sizeof(struct inotify_event) + event->len;
             }
         } });
+#else
+    // macOS/其他平台: FileWatcher 暂不支持
+    pImpl_->running = false;
+    return false;
 #endif
     return true;
 }

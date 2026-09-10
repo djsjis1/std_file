@@ -1,10 +1,13 @@
 #include <gtest/gtest.h>
 #include "file.h"
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <future>
 #include <iostream>
+#include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -710,6 +713,65 @@ namespace
         EXPECT_FALSE(idx.validate(P("li.txt")));
     }
 
+    // LineIndex 语义对齐: 空文件、尾换行、构造失败
+    TEST_F(FileTest, LineIndexSemantics)
+    {
+        // 空文件: lineCount() 应为 0
+        WriteOk("empty.txt", "");
+        My::LineIndex idxEmpty(P("empty.txt"));
+        EXPECT_TRUE(idxEmpty.valid());
+        EXPECT_EQ(idxEmpty.lineCount(), 0u);
+        EXPECT_EQ(My::File::lineCount(P("empty.txt")).value_or(999), 0u);
+
+        // 尾换行: "a\n" 应为 1 行（与 File::lineCount 一致）
+        WriteOk("trail.txt", "a\n");
+        My::LineIndex idxTrail(P("trail.txt"));
+        EXPECT_TRUE(idxTrail.valid());
+        EXPECT_EQ(idxTrail.lineCount(), 1u);
+        EXPECT_EQ(*My::File::lineCount(P("trail.txt")), 1u);
+
+        // "a\nb\n" 应为 2 行
+        WriteOk("trail2.txt", "a\nb\n");
+        My::LineIndex idxTrail2(P("trail2.txt"));
+        EXPECT_EQ(idxTrail2.lineCount(), 2u);
+
+        // 无尾换行: "a\nb" 应为 2 行
+        WriteOk("notrail.txt", "a\nb");
+        My::LineIndex idxNoTrail(P("notrail.txt"));
+        EXPECT_EQ(idxNoTrail.lineCount(), 2u);
+
+        // 构造失败: 不存在的文件
+        My::LineIndex idxBad(P("no_such_file.txt"));
+        EXPECT_FALSE(idxBad.valid());
+        EXPECT_EQ(idxBad.lineCount(), 0u);
+        EXPECT_FALSE(idxBad.validate(P("no_such_file.txt")));
+
+        // 索引版 readLine 对无效索引应返回 nullopt
+        EXPECT_FALSE(My::File::readLine(P("trail.txt"), 1, idxBad).has_value());
+    }
+
+    // LineIndex 超长行（超过 128KB 块）
+    TEST_F(FileTest, LineIndexLongLine)
+    {
+        const std::string longLine(200 * 1024, 'L'); // 200KB
+        WriteOk("long_idx.txt", longLine + "\nshort");
+
+        My::LineIndex idx(P("long_idx.txt"));
+        EXPECT_TRUE(idx.valid());
+        EXPECT_EQ(idx.lineCount(), 2u);
+
+        // 索引版读取超长行
+        auto r = My::File::readLine(P("long_idx.txt"), 1, idx);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->size(), longLine.size());
+        EXPECT_EQ(*r, longLine);
+
+        // 第二行
+        auto r2 = My::File::readLine(P("long_idx.txt"), 2, idx);
+        ASSERT_TRUE(r2.has_value());
+        EXPECT_EQ(*r2, "short");
+    }
+
     // #3 mmap 读取
     TEST_F(FileTest, ReadMapped)
     {
@@ -803,6 +865,46 @@ namespace
         EXPECT_FALSE(My::File::fileHash(P("nope.txt")).has_value());
     }
 
+    // SHA-256 NIST 标准向量补充
+    TEST_F(FileTest, FileHashNistVectors)
+    {
+        // SHA-256("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")
+        // = 248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1
+        WriteOk("nist1.txt", "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
+        auto h1 = My::File::fileHash(P("nist1.txt"));
+        ASSERT_TRUE(h1.has_value());
+        EXPECT_EQ(*h1, "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+
+        // SHA-256("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu")
+        // = cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1
+        WriteOk("nist2.txt", "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu");
+        auto h2 = My::File::fileHash(P("nist2.txt"));
+        ASSERT_TRUE(h2.has_value());
+        EXPECT_EQ(*h2, "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1");
+    }
+
+    // 中文文件名目录列举
+    TEST_F(FileTest, ChinesePathDirectoryList)
+    {
+        WriteOk("\xe6\xb5\x8b\xe8\xaf\x95.txt", "content"); // 测试.txt
+        WriteOk("normal.txt", "normal");
+
+        auto files = My::File::listFiles(kTestDir);
+        EXPECT_GE(files.size(), 2u);
+
+        // 检查中文文件名是否在列表中
+        bool foundChinese = false;
+        for (const auto &f : files)
+        {
+            if (f.find("\xe6\xb5\x8b\xe8\xaf\x95") != std::string::npos)
+            {
+                foundChinese = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(foundChinese) << "中文文件名未在 listFiles 结果中找到";
+    }
+
     // #6 异步 IO
     TEST_F(FileTest, AsyncReadWrite)
     {
@@ -835,7 +937,8 @@ namespace
         }
     }
 
-    // #10 文件监听
+    // #10 文件监听（仅 Windows/Linux 支持，macOS 桩返回 false）
+#if defined(_WIN32) || defined(__linux__)
     TEST_F(FileTest, FileWatcherBasic)
     {
         My::FileWatcher watcher;
@@ -849,6 +952,9 @@ namespace
             std::lock_guard lock(mtx);
             events.emplace_back(std::string(path), ev); }));
         EXPECT_TRUE(watcher.isWatching());
+
+        // 等待工作线程发出首次 ReadDirectoryChangesW
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         // 创建文件触发事件
         WriteOk("watched.txt", "hello");
@@ -869,4 +975,580 @@ namespace
         std::lock_guard lock(mtx);
         EXPECT_GE(events.size(), 1u);
     }
+#endif // _WIN32 || __linux__
+    // ==================== 压力测试 ====================
+
+    // 压测：多线程并发读写多个大文件
+    TEST_F(FileTest, Stress_ConcurrentLargeFileReadWrite)
+    {
+        constexpr int kFiles = 8;
+        constexpr size_t kSize = 4 * 1024 * 1024; // 每文件 4MB
+
+        // 准备测试文件
+        const std::string payload(kSize, 'A');
+        for (int i = 0; i < kFiles; ++i)
+        {
+            WriteOk("stress_" + std::to_string(i) + ".bin", payload);
+        }
+
+        // 并发读取全部文件
+        auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::thread> threads;
+        std::atomic<int> readOk{0};
+        for (int i = 0; i < kFiles; ++i)
+        {
+            threads.emplace_back([&, i]()
+                                 {
+                for (int rep = 0; rep < 5; ++rep)
+                {
+                    auto data = My::File::readall(P("stress_" + std::to_string(i) + ".bin"));
+                    if (data && data->size() == kSize) readOk.fetch_add(1, std::memory_order_relaxed);
+                } });
+        }
+        for (auto &t : threads)
+            t.join();
+        auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+        EXPECT_EQ(readOk.load(), kFiles * 5);
+        std::cout << "[stress] concurrent read " << kFiles << " files x 5 reps: " << ms << " ms\n";
+
+        // 并发写入全部文件
+        threads.clear();
+        std::atomic<int> writeOk{0};
+        const std::string newPayload(kSize, 'B');
+        t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < kFiles; ++i)
+        {
+            threads.emplace_back([&, i]()
+                                 {
+                bool ok = My::File::writeAll(P("stress_" + std::to_string(i) + ".bin"), newPayload);
+                if (ok) writeOk.fetch_add(1, std::memory_order_relaxed); });
+        }
+        for (auto &t : threads)
+            t.join();
+        ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+        EXPECT_EQ(writeOk.load(), kFiles);
+        std::cout << "[stress] concurrent write " << kFiles << " files: " << ms << " ms\n";
+
+        // 验证内容一致
+        for (int i = 0; i < kFiles; ++i)
+        {
+            auto data = My::File::readall(P("stress_" + std::to_string(i) + ".bin"));
+            ASSERT_TRUE(data.has_value());
+            EXPECT_EQ(data->size(), kSize);
+        }
+    }
+
+    // 压测：高频小文件操作（创建/读取/删除）
+    TEST_F(FileTest, Stress_HighFreqSmallFile)
+    {
+        constexpr int kCount = 500;
+
+        // 批量创建
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < kCount; ++i)
+        {
+            ASSERT_TRUE(My::File::writeAll(P("sf_" + std::to_string(i) + ".txt"),
+                                           "content_" + std::to_string(i)));
+        }
+        auto createMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::cout << "[stress] create " << kCount << " small files: " << createMs << " ms\n";
+
+        // 批量读取
+        t0 = std::chrono::steady_clock::now();
+        int readOk = 0;
+        for (int i = 0; i < kCount; ++i)
+        {
+            auto data = My::File::readall(P("sf_" + std::to_string(i) + ".txt"));
+            if (data && *data == "content_" + std::to_string(i))
+                ++readOk;
+        }
+        auto readMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        EXPECT_EQ(readOk, kCount);
+        std::cout << "[stress] read " << kCount << " small files: " << readMs << " ms\n";
+
+        // 批量删除
+        t0 = std::chrono::steady_clock::now();
+        int delOk = 0;
+        for (int i = 0; i < kCount; ++i)
+        {
+            if (My::File::remove(P("sf_" + std::to_string(i) + ".txt")))
+                ++delOk;
+        }
+        auto delMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        EXPECT_EQ(delOk, kCount);
+        std::cout << "[stress] delete " << kCount << " small files: " << delMs << " ms\n";
+    }
+
+    // 压测：LineIndex 随机行访问（对比无索引性能）
+    TEST_F(FileTest, Stress_LineIndexRandomAccess)
+    {
+        constexpr size_t kLines = 50000;
+        constexpr int kAccesses = 1000;
+
+        // 生成 5 万行文件
+        {
+            const std::string line(99, 'x');
+            My::File::Writer w = My::File::write(P("idx_perf.txt"));
+            for (size_t i = 0; i < kLines; ++i)
+            {
+                w.writeLine(line + std::to_string(i));
+            }
+            ASSERT_TRUE(w.commit());
+        }
+
+        // 生成随机行号
+        std::mt19937 rng(42);
+        std::uniform_int_distribution<size_t> dist(1, kLines);
+        std::vector<size_t> targets;
+        for (int i = 0; i < kAccesses; ++i)
+        {
+            targets.push_back(dist(rng));
+        }
+
+        // 无索引：顺序扫描
+        auto t0 = std::chrono::steady_clock::now();
+        int noIdxOk = 0;
+        for (auto ln : targets)
+        {
+            auto r = My::File::readLine(P("idx_perf.txt"), ln);
+            if (r)
+                ++noIdxOk;
+        }
+        auto noIdxMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+        // 有索引：O(log N) 定位
+        My::LineIndex idx(P("idx_perf.txt"));
+        auto t1 = std::chrono::steady_clock::now();
+        int idxOk = 0;
+        for (auto ln : targets)
+        {
+            auto r = My::File::readLine(P("idx_perf.txt"), ln, idx);
+            if (r)
+                ++idxOk;
+        }
+        auto idxMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+
+        EXPECT_EQ(noIdxOk, kAccesses);
+        EXPECT_EQ(idxOk, kAccesses);
+        EXPECT_LT(idxMs, noIdxMs); // 索引应更快
+
+        std::cout << "[stress] readLine x" << kAccesses << " without index: " << noIdxMs << " ms\n";
+        std::cout << "[stress] readLine x" << kAccesses << " with LineIndex: " << idxMs << " ms\n";
+        std::cout << "[stress] speedup: " << (noIdxMs / std::max(idxMs, 0.1)) << "x\n";
+    }
+
+    // 压测：mmap 大文件反复读取
+    TEST_F(FileTest, Stress_MmapLargeFile)
+    {
+        constexpr size_t kSize = 10 * 1024 * 1024; // 10MB
+        const std::string payload(kSize, 'M');
+        ASSERT_TRUE(My::File::writeAll(P("mmap_stress.bin"), payload));
+
+        // 反复 mmap 读取
+        constexpr int kReps = 20;
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < kReps; ++i)
+        {
+            auto mmf = My::File::readMapped(P("mmap_stress.bin"));
+            ASSERT_TRUE(mmf.has_value());
+            EXPECT_EQ(mmf->size(), kSize);
+        }
+        auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::cout << "[stress] mmap read " << kReps << " x 10MB: " << ms << " ms ("
+                  << MbPerSec(kSize * kReps, ms) << " MB/s)\n";
+
+        // 对比 readall
+        t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < kReps; ++i)
+        {
+            auto data = My::File::readall(P("mmap_stress.bin"));
+            ASSERT_TRUE(data.has_value());
+            EXPECT_EQ(data->size(), kSize);
+        }
+        auto readallMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::cout << "[stress] readall " << kReps << " x 10MB: " << readallMs << " ms ("
+                  << MbPerSec(kSize * kReps, readallMs) << " MB/s)\n";
+    }
+
+    // 压测：异步 IO 高并发
+    TEST_F(FileTest, Stress_AsyncIOConcurrency)
+    {
+        constexpr int kFiles = 16;
+        constexpr int kOpsPerFile = 4;
+
+        // 准备文件
+        for (int i = 0; i < kFiles; ++i)
+        {
+            WriteOk("async_s_" + std::to_string(i) + ".txt",
+                    std::string(1024, 'A' + (i % 26)));
+        }
+
+        // 同时提交大量异步读
+        auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::future<std::optional<std::string>>> futures;
+        for (int i = 0; i < kFiles; ++i)
+        {
+            for (int j = 0; j < kOpsPerFile; ++j)
+            {
+                futures.push_back(My::File::asyncReadall(P("async_s_" + std::to_string(i) + ".txt")));
+            }
+        }
+
+        int ok = 0;
+        for (auto &f : futures)
+        {
+            auto r = f.get();
+            if (r && r->size() == 1024)
+                ++ok;
+        }
+        auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        EXPECT_EQ(ok, kFiles * kOpsPerFile);
+        std::cout << "[stress] async read " << kFiles * kOpsPerFile << " ops: " << ms << " ms\n";
+
+        // 并发异步写
+        futures.clear();
+        std::vector<std::future<bool>> wfuts;
+        t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < kFiles; ++i)
+        {
+            for (int j = 0; j < kOpsPerFile; ++j)
+            {
+                wfuts.push_back(My::File::asyncWriteAll(
+                    P("async_w_" + std::to_string(i) + "_" + std::to_string(j) + ".txt"),
+                    std::string(512, 'W')));
+            }
+        }
+        int wok = 0;
+        for (auto &f : wfuts)
+        {
+            if (f.get())
+                ++wok;
+        }
+        ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        EXPECT_EQ(wok, kFiles * kOpsPerFile);
+        std::cout << "[stress] async write " << kFiles * kOpsPerFile << " ops: " << ms << " ms\n";
+    }
+
+    // ==================== 混合测试 ====================
+
+    // 混合：多线程交替读写同一文件
+    TEST_F(FileTest, Mixed_ConcurrentReadWriteSameFile)
+    {
+        WriteOk("mixed_rw.txt", "initial");
+
+        std::atomic<bool> stop{false};
+        std::atomic<int> writeCount{0};
+        std::atomic<int> readCount{0};
+
+        // 写线程：反复覆盖写入
+        std::thread writer([&]()
+                           {
+            for (int i = 0; i < 50; ++i)
+            {
+                My::File::writeAll(P("mixed_rw.txt"), "iteration_" + std::to_string(i));
+                writeCount.fetch_add(1, std::memory_order_relaxed);
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+            stop.store(true, std::memory_order_release); });
+
+        // 读线程：反复读取（允许读到旧内容，但不应崩溃或读到损坏数据）
+        std::thread reader([&]()
+                           {
+            while (!stop.load(std::memory_order_acquire))
+            {
+                auto data = My::File::readall(P("mixed_rw.txt"));
+                if (data && !data->empty()) readCount.fetch_add(1, std::memory_order_relaxed);
+            } });
+
+        writer.join();
+        reader.join();
+
+        EXPECT_EQ(writeCount.load(), 50);
+        EXPECT_GT(readCount.load(), 0);
+        std::cout << "[mixed] concurrent read/write: reads=" << readCount.load()
+                  << " writes=" << writeCount.load() << "\n";
+
+        // 最终文件内容应完整（最后一次写入）
+        auto final_data = My::File::readall(P("mixed_rw.txt"));
+        ASSERT_TRUE(final_data.has_value());
+        EXPECT_EQ(*final_data, "iteration_49");
+    }
+
+    // 混合：文件监听 + 多文件写入
+#if defined(_WIN32) || defined(__linux__)
+    TEST_F(FileTest, Mixed_WatcherAndMultiFileWriter)
+    {
+        My::File::createDirectories(P("watch_mix"));
+
+        My::FileWatcher watcher;
+        std::mutex mtx;
+        std::vector<std::pair<std::string, My::FileEvent>> events;
+
+        ASSERT_TRUE(watcher.start(P("watch_mix"), [&](std::string_view path, My::FileEvent ev)
+                                  {
+            std::lock_guard lock(mtx);
+            events.emplace_back(std::string(path), ev); }));
+
+        // 等待工作线程发出首次 ReadDirectoryChangesW
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        // 在监听目录下创建多个文件
+        for (int i = 0; i < 5; ++i)
+        {
+            ASSERT_TRUE(My::File::writeAll(P("watch_mix/f_" + std::to_string(i) + ".txt"),
+                                           "data_" + std::to_string(i)));
+        }
+
+        // 等待事件
+        for (int i = 0; i < 40; ++i)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::lock_guard lock(mtx);
+            if (events.size() >= 5)
+                break;
+        }
+
+        watcher.stop();
+
+        std::lock_guard lock(mtx);
+        EXPECT_GE(events.size(), 5u);
+        std::cout << "[mixed] watcher received " << events.size() << " events for 5 file creations\n";
+    }
+#endif // _WIN32 || __linux__
+
+    // 混合：行索引 + 行编辑（验证索引失效与重建）
+    TEST_F(FileTest, Mixed_LineIndexAndLineEdit)
+    {
+        // 生成文件（无尾换行，避免 LineIndex 尾部空行计数差异）
+        {
+            My::File::Writer w = My::File::write(P("mix_idx.txt"));
+            for (int i = 0; i < 100; ++i)
+            {
+                if (i > 0)
+                    w.write("\n");
+                w.write("line_" + std::to_string(i));
+            }
+            ASSERT_TRUE(w.commit());
+        }
+
+        // 建立索引
+        My::LineIndex idx(P("mix_idx.txt"));
+        EXPECT_EQ(idx.lineCount(), 100u);
+        EXPECT_TRUE(idx.validate(P("mix_idx.txt")));
+
+        // 用索引读取
+        auto r1 = My::File::readLine(P("mix_idx.txt"), 50, idx);
+        ASSERT_TRUE(r1.has_value());
+        EXPECT_EQ(*r1, "line_49");
+
+        // 行编辑：在第 50 行前插入
+        ASSERT_TRUE(My::File::insertBeforeLine(P("mix_idx.txt"), 50, "inserted_line\n"));
+
+        // 索引应失效（文件已修改）
+        EXPECT_FALSE(idx.validate(P("mix_idx.txt")));
+
+        // 重建索引
+        My::LineIndex idx2(P("mix_idx.txt"));
+        EXPECT_EQ(idx2.lineCount(), 101u);
+
+        // 用新索引读取
+        auto r2 = My::File::readLine(P("mix_idx.txt"), 50, idx2);
+        ASSERT_TRUE(r2.has_value());
+        EXPECT_EQ(*r2, "inserted_line");
+
+        auto r3 = My::File::readLine(P("mix_idx.txt"), 51, idx2);
+        ASSERT_TRUE(r3.has_value());
+        EXPECT_EQ(*r3, "line_49");
+
+        // 删除行后索引再次失效
+        ASSERT_TRUE(My::File::deleteLine(P("mix_idx.txt"), 50));
+        EXPECT_FALSE(idx2.validate(P("mix_idx.txt")));
+
+        My::LineIndex idx3(P("mix_idx.txt"));
+        EXPECT_EQ(idx3.lineCount(), 100u);
+    }
+
+    // 混合：目录遍历 + 文件操作
+    TEST_F(FileTest, Mixed_DirectoryWalkAndOps)
+    {
+        // 创建目录结构
+        My::File::createDirectories(P("walk/a"));
+        My::File::createDirectories(P("walk/b/c"));
+        WriteOk("walk/f1.txt", "hello");
+        WriteOk("walk/f2.txt", "world");
+        WriteOk("walk/a/f3.txt", "aaa");
+        WriteOk("walk/b/f4.txt", "bbb");
+        WriteOk("walk/b/c/f5.txt", "ccc");
+
+        // 遍历并对每个文件计算哈希
+        int fileCount = 0;
+        std::vector<std::string> hashes;
+        My::File::walk(P("walk"), [&](std::string_view path, bool isDir)
+                       {
+            if (!isDir)
+            {
+                ++fileCount;
+                auto h = My::File::fileHash(std::string(path));
+                if (h) hashes.push_back(*h);
+            }
+            return true; });
+
+        EXPECT_EQ(fileCount, 5);
+        EXPECT_EQ(hashes.size(), 5u);
+
+        // 遍历并对每个文件用异步读取
+        std::vector<std::future<std::optional<std::string>>> futures;
+        My::File::walk(P("walk"), [&](std::string_view path, bool isDir)
+                       {
+            if (!isDir)
+            {
+                futures.push_back(My::File::asyncReadall(std::string(path)));
+            }
+            return true; });
+
+        int asyncOk = 0;
+        for (auto &f : futures)
+        {
+            if (f.get())
+                ++asyncOk;
+        }
+        EXPECT_EQ(asyncOk, 5);
+
+        // glob 匹配 + 读取验证
+        auto txts = My::File::globFiles(P("walk"), "*.txt");
+        EXPECT_GE(txts.size(), 2u); // 至少直接子文件
+    }
+
+    // 混合：原子写 + 哈希 + 异步 一致性验证
+    TEST_F(FileTest, Mixed_HashAtomicAsyncConsistency)
+    {
+        // 原子写入 -> 立即哈希 -> 异步读取 -> 对比哈希
+        const std::string content = "consistency_test_data_12345";
+
+        ASSERT_TRUE(My::File::writeAllAtomic(P("hash_test.txt"), content));
+
+        // 同步哈希
+        auto syncHash = My::File::fileHash(P("hash_test.txt"));
+        ASSERT_TRUE(syncHash.has_value());
+
+        // 异步读取后计算哈希
+        auto fut = My::File::asyncReadall(P("hash_test.txt"));
+        auto asyncData = fut.get();
+        ASSERT_TRUE(asyncData.has_value());
+        EXPECT_EQ(*asyncData, content);
+
+        // 再次同步读取验证一致性
+        auto syncData = My::File::readall(P("hash_test.txt"));
+        ASSERT_TRUE(syncData.has_value());
+        EXPECT_EQ(*syncData, content);
+
+        // 多次原子写后哈希应变化
+        ASSERT_TRUE(My::File::writeAllAtomic(P("hash_test.txt"), "different_content"));
+        auto newHash = My::File::fileHash(P("hash_test.txt"));
+        ASSERT_TRUE(newHash.has_value());
+        EXPECT_NE(*syncHash, *newHash);
+    }
+
+    // 混合：全功能综合场景
+    TEST_F(FileTest, Mixed_AllFeaturesCombined)
+    {
+        // 先重置错误回调（前面用例可能已替换）
+        static std::atomic<int> sErrorCount{0};
+        sErrorCount.store(0);
+        My::setErrorHandler([](std::string_view, std::string_view, std::string_view)
+                            { sErrorCount.fetch_add(1, std::memory_order_relaxed); });
+
+        // 1. Writer 链式写入大文件（无尾换行）
+        {
+            My::File::Writer w = My::File::write(P("all_feat.txt"));
+            w.setAutoCommit(true).reserve(4096);
+            for (int i = 0; i < 200; ++i)
+            {
+                if (i > 0)
+                    w.write("\n");
+                w.write("record_" + std::to_string(i));
+            }
+        }
+
+        // 2. 建立行索引
+        My::LineIndex idx(P("all_feat.txt"));
+        EXPECT_EQ(idx.lineCount(), 200u);
+
+        // 3. 用索引随机读取
+        auto r1 = My::File::readLine(P("all_feat.txt"), 100, idx);
+        ASSERT_TRUE(r1.has_value());
+        EXPECT_EQ(*r1, "record_99");
+
+        // 4. mmap 读取并验证
+        auto mmf = My::File::readMapped(P("all_feat.txt"));
+        ASSERT_TRUE(mmf.has_value());
+        EXPECT_GT(mmf->size(), 0u);
+
+        // 5. 文件哈希
+        auto hash = My::File::fileHash(P("all_feat.txt"));
+        ASSERT_TRUE(hash.has_value());
+        EXPECT_EQ(hash->size(), 64u); // SHA-256 hex
+
+        // 6. 异步读取
+        auto fut = My::File::asyncReadall(P("all_feat.txt"));
+        auto asyncData = fut.get();
+        ASSERT_TRUE(asyncData.has_value());
+
+        // 7. 目录遍历确认文件存在
+        auto files = My::File::listFiles(kTestDir);
+        EXPECT_GE(files.size(), 1u);
+
+        // 8. 触发一些错误（不存在的文件，readall/readLine/lineCount 均会触发回调）
+        EXPECT_FALSE(My::File::readall(P("nonexistent.txt")).has_value());
+        EXPECT_FALSE(My::File::readLine(P("nonexistent.txt"), 1).has_value());
+        EXPECT_FALSE(My::File::lineCount(P("nonexistent.txt")).has_value());
+        EXPECT_GE(sErrorCount.load(), 3);
+
+        // 恢复默认回调
+        My::setErrorHandler(My::ErrorHandler{});
+        My::setErrorHandler([](std::string_view, std::string_view, std::string_view) {});
+
+        std::cout << "[mixed] all features combined: OK (errors captured: " << sErrorCount.load() << ")\n";
+    }
+
+    // 混合：Writer 自动提交 + 手动提交混合
+    TEST_F(FileTest, Mixed_WriterAutoAndManualCommit)
+    {
+        // 自动提交
+        {
+            My::File::Writer w = My::File::write(P("wm1.txt"));
+            w.setAutoCommit(true).write("auto");
+        }
+        auto d1 = My::File::readall(P("wm1.txt"));
+        ASSERT_TRUE(d1.has_value());
+        EXPECT_EQ(*d1, "auto");
+
+        // 手动提交
+        {
+            My::File::Writer w = My::File::write(P("wm2.txt"));
+            w.write("manual");
+            ASSERT_TRUE(w.commit());
+        }
+        auto d2 = My::File::readall(P("wm2.txt"));
+        ASSERT_TRUE(d2.has_value());
+        EXPECT_EQ(*d2, "manual");
+
+        // 追加模式 + 自动提交
+        {
+            My::File::Writer w = My::File::write(P("wm1.txt"), true);
+            w.setAutoCommit(true).write("_appended");
+        }
+        auto d3 = My::File::readall(P("wm1.txt"));
+        ASSERT_TRUE(d3.has_value());
+        EXPECT_EQ(*d3, "auto_appended");
+
+        // insert 模式 + 手动提交
+        ASSERT_TRUE(My::File::insert(P("wm2.txt")).insertBeforeLine(1, "prefix_").commit());
+        auto d4 = My::File::readall(P("wm2.txt"));
+        ASSERT_TRUE(d4.has_value());
+        EXPECT_EQ(*d4, "prefix_manual");
+    }
+
 } // namespace

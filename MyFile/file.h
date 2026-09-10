@@ -24,8 +24,9 @@ namespace My
     ErrorHandler getErrorHandler();
 
     // ==================== 行索引缓存 ====================
-    // 一次遍历记录每行起始字节偏移，后续 readLine 经二分查找 O(log N) 定位。
+    // 一次遍历记录每行起始字节偏移，后续 readLine 经 O(1) 直接寻址定位。
     // 构造时记录 size/mtime，validate() 可检测文件外部变更。
+    // 行数语义与 File::lineCount 一致：空文件 0 行，末尾 \n 后不计空行。
     class LineIndex
     {
     public:
@@ -33,11 +34,13 @@ namespace My
         size_t lineCount() const;
         std::optional<std::uintmax_t> lineStart(size_t lineNumber) const;
         bool validate(std::string_view filename) const;
+        bool valid() const; // 构造是否成功（文件能打开且读取无错）
 
     private:
         std::vector<std::uintmax_t> offsets_;
         std::uintmax_t fileSize_ = 0;
         std::chrono::system_clock::time_point mtime_;
+        bool valid_ = false;
     };
 
     // ==================== mmap 内存映射文件 ====================
@@ -70,8 +73,8 @@ namespace My
     };
 
     // ==================== 文件监听 ====================
-    // Windows: ReadDirectoryChangesW; Linux: inotify; macOS: FSEvents(待实现)。
-    // 回调在内部线程执行，回调内避免长时间阻塞。
+    // Windows: ReadDirectoryChangesW (支持递归); Linux: inotify (仅监视指定目录，不递归);
+    // macOS: 暂不支持 (start() 返回 false)。回调在内部线程执行，回调内避免长时间阻塞。
     enum class FileEvent : uint8_t
     {
         Created,
