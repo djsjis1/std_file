@@ -101,7 +101,7 @@ Linux 用 `inotify`。回调接收路径和 `FileEvent`(Created/Modified/Deleted
   - walk 已使用 `it.increment(ec)` 非抛异常遍历。
 - [x] **2026-09-10 代码审查修复(阶段 4: 架构整理)**——
   - 错误模型统一: 索引版 readLine 行号 0/越界补充 PrintError 调用, 与非索引版一致;
-  - file.cpp 拆分评估: 2361 行单文件库, “拷贝 MyFile/ 即用” 是核心集成方式, 拆分增加复杂度, 保持现状;
+  - file.cpp 拆分评估: 2361 行单文件库, “拷贝 MyFile/ 即用” 是核心集成方式, 拆分增加复杂度, 保持现状(已于 2026-09-10 完成拆分);
   - README 语义契约: 已文档化(行号从 1 开始, `\n` 计行, 末尾 `\n` 后无空行, 与 `wc -l` 一致);
   - LineIndex 稀疏模式、file.cpp 拆分多 TU 记入后续方向。
 - [x] **2026-09-10 代码审查修复(阶段 5: 正确性收尾)**——
@@ -116,6 +116,22 @@ Linux 用 `inotify`。回调接收路径和 `FileEvent`(Created/Modified/Deleted
   - Writer::isPoisoned() 公共查询接口, 调用方可主动检测而非仅靠 commit 失败;
   - insert() TOCTOU 窗口注释(固有风险, 不值得修);
   - poison 路径回归用例: InsertPoisonedOnDirectory(对目录路径 insert → poisoned → commit 拒绝); 测试数量 48 → 49。
+- [x] **2026-09-10 拆分巨石 file.cpp 为 11 个翻译单元**——
+  原 file.cpp(2570 行)拆为:
+  `platform.cpp`(平台 IO 原语+错误报告+SIMD 分派)、
+  `file_info.cpp`(文件信息查询+目录操作)、
+  `file_read.cpp`(全部读取函数)、
+  `file_write.cpp`(writeAll/writeBytes/appendAll/writeAllAtomic)、
+  `file_edit.cpp`(insertAt/insertBeforeLine/insertAfterLine/deleteLine/deleteLines+RewriteRange)、
+  `line_index.cpp`(LineIndex)、
+  `mmap_file.cpp`(MemoryMappedFile)、
+  `writer.cpp`(Writer 链式构建器+insert 工厂)、
+  `hash_glob.cpp`(SHA-256+listFiles/walk/globFiles)、
+  `watcher.cpp`(FileWatcher Win/Linux)、
+  `async.cpp`(ThreadPool+asyncReadall/asyncWriteAll)。
+  内部公共头 `detail/internal.h` 声明平台原语、SIMD 分派、ThreadPool 等;
+  `file.h` 伞形头不动, 使用者零感知。
+  构建无警告, 49/49 测试通过。
 - [x] **2026-09-08 原子写掉电安全**——`writeAllAtomic` 新增 `durable` 参数(默认 true):
       写完临时文件后 `FlushFileBuffers`/`fsync` 刷盘再替换,消除"rename 成功但内容尚未落盘"
       的掉电窗口;`false` 保留原性能特征。临时文件名加 PID,多进程写同一目标不再撞名。

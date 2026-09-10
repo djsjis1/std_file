@@ -24,7 +24,17 @@ cmake_minimum_required(VERSION 3.15)
 project(MyFile VERSION 1.0.0 LANGUAGES CXX)
 
 add_library(MyFile STATIC
-    file.cpp
+    platform.cpp
+    file_info.cpp
+    file_read.cpp
+    file_write.cpp
+    file_edit.cpp
+    line_index.cpp
+    mmap_file.cpp
+    writer.cpp
+    hash_glob.cpp
+    watcher.cpp
+    async.cpp
 )
 add_library(MyFile::MyFile ALIAS MyFile)
 
