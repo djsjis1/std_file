@@ -229,6 +229,9 @@ namespace My
         // 启用/禁用析构自动提交（默认禁用）
         Writer &setAutoCommit(bool enable);
 
+        // 查询 Writer 是否已污染（insert 读取失败时置 true，commit 会拒绝）
+        bool isPoisoned() const;
+
     private:
         class Impl;
         std::unique_ptr<Impl> pImpl;

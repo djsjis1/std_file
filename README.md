@@ -1,6 +1,6 @@
 # My::File —— 跨平台文件操作库
 
-基于 C++23 的轻量文件操作库,提供文件信息查询、读写、行操作、目录管理、原子写入、行索引缓存、mmap 零拷贝读取、SIMD 换行扫描、异步 IO、文件监听、SHA-256 哈希等能力。仅依赖标准库,支持 Windows(MSVC)/ Linux / macOS。
+基于 C++23 的轻量文件操作库,提供文件信息查询、读写、行操作、目录管理、原子写入、行索引缓存、mmap 零拷贝读取、SIMD 换行扫描、异步 IO、文件监听、SHA-256 哈希等能力。仅依赖标准库,支持 Windows(MSVC)/ Linux / macOS(文件监听暂不可用)。
 
 ## 引入到你的项目
 
@@ -85,9 +85,9 @@ My::File::move("old.txt", "new.txt");                 // 移动/重命名
 | --- | --- |
 | `readall(filename)` | 读取整个文件 |
 | `readBytes(filename)` | 读取整个文件(二进制) |
-| `readMapped(filename)` | mmap 零拷贝读取(返回 `MemoryMappedFile`,失败返回空) |
+| `readMapped(filename)` | mmap 零拷贝读取(返回 `MemoryMappedFile`,空文件或失败返回空) |
 | `readLine(filename, n)` | 读取第 n 行(1 起) |
-| `readLine(filename, n, index)` | 用 `LineIndex` 快速读取第 n 行(O(log N)) |
+| `readLine(filename, n, index)` | 用 `LineIndex` 快速读取第 n 行(O(1) 直接寻址) |
 | `readLines(filename, start, end)` | 读取连续行区间 |
 | `readLines(filename, {1,5,10})` | 读取非连续多行(按原顺序返回) |
 | `readAllLines(filename)` | 读取全部行 |
@@ -114,9 +114,9 @@ My::File::move("old.txt", "new.txt");                 // 移动/重命名
 ### 行索引与 mmap
 
 ```cpp
-// 行索引:一次遍历,后续随机行访问 O(log N)
+// 行索引:一次遍历,后续随机行访问 O(1)
 My::LineIndex idx("big.log");
-auto line = My::File::readLine("big.log", 50000, idx); // 二分定位 + seek+read
+auto line = My::File::readLine("big.log", 50000, idx); // 直接寻址 + seek+read
 if (idx.validate("big.log")) { /* 索引仍有效 */ }
 
 // mmap 零拷贝读取(失败回退 readall)
@@ -125,6 +125,8 @@ if (mmf) {
     std::string_view view = mmf->view(); // 直接引用映射内存
 }
 ```
+
+> **LineIndex 失效检测局限**:用 `size + mtime` 判断文件是否变更。在 mtime 粒度为 1~2 秒的文件系统(如 FAT32、部分网络文件系统)上,同尺寸同 mtime 但内容已变的场景无法检出。如需强一致,请在业务层自行校验。
 
 ### 目录遍历与哈希
 
@@ -145,6 +147,12 @@ if (mmf) {
 内部线程池大小为 `hardware_concurrency`。
 
 ### 文件监听
+
+| 平台 | 支持 |
+| --- | --- |
+| Windows | ✓ (`ReadDirectoryChangesW`) |
+| Linux | ✓ (`inotify`) |
+| macOS | ✗ (桩实现,`start()` 返回 false) |
 
 ```cpp
 My::FileWatcher watcher;
@@ -192,7 +200,7 @@ iostream(`fstream`) 每一字节都经过 `streambuf` 虚函数层次与多层�
 2. **128KB 大块 IO**——系统调用次数降到最低。
 3. **`memchr` 拆行 + 零拷贝视图**——`LineReader` 内部大块读 + `memchr`(CRT SIMD 实现)扫描 `\n`,取代 `std::getline` 的逐字符扫描;`forEachLine` 回调直接引用内部块缓冲区(仅在回调内有效,需保留请自行拷贝),消除每行一次 `std::string` 拷贝;支持跨块超长行。
 4. **SIMD 换行扫描**——`lineCount` 用自实现 SSE2/AVX2 向量比较 + 运行时分派(CPUID 检测),一次扫描计数全部换行。
-5. **mmap 零拷贝**——`readMapped` 直接映射文件到内存,省去内核→用户态拷贝,大文件按页惰性加载。
+5. **mmap 零拷贝**——`readMapped` 直接映射文件到内存,省去内核→用户态拷贝,大文件按页惰性加载。空文件返回空映射(调用方应检查 `view().empty()`)。
 6. **`resize_and_overwrite`(C++23)**——`readall` 直接在目标缓冲区上读,消除"先清零再读入"的双重内存写入。
 7. **`WriteFull`/`ReadFull`**——循环处理短读短写,兼容全部平台语义。
 8. **错误检查到 close**——写入后显式 `close` 并检查,捕获磁盘满等延迟错误;读中途的 I/O 错误不会被当成 EOF 静默吞掉,读取类 API 会返回失败而不是返回截断的数据。
@@ -209,7 +217,7 @@ iostream(`fstream`) 每一字节都经过 `streambuf` 虚函数层次与多层�
 | `readLine`(第 10 万行) | ~5 ms |
 | `readMapped`(mmap) | ~22500 MB/s(零拷贝,页面缓存命中) |
 
-> 数据由 `tests/test_file.cpp` 的 `FileTest.PerformanceReadAndWrite` 用例输出,仅供参考;读取路径已接近页面缓存带宽上限。
+> 数据由 `tests/test_file.cpp` 的 `FileTest.PerformanceReadAndWrite` 用例输出,仅供参考。**读取性能数据基于页缓存命中**(文件已预热到内存),实际冷读场景会受磁盘 IO 限制。
 
 ## 测试
 
@@ -222,15 +230,15 @@ ctest --test-dir build -C Release --output-on-failure
 # 或直接运行: build/Release/file_tests.exe
 ```
 
-48 个用例覆盖:
+49 个用例覆盖:
 
-- **功能测试**:全部 API 的正常路径、负路径与边界(空文件、行号 0/越界、重复行号、无尾换行、跨 128KB 块的超长行与跨块大文件行编辑、UTF-8 中文路径、commit 失败重试、原子写入无临时文件残留)
+- **功能测试**:全部 API 的正常路径、负路径与边界(空文件、行号 0/越界、重复行号、无尾换行、跨 128KB 块的超长行与跨块大文件行编辑、UTF-8 中文路径、commit 失败重试、原子写入无临时文件残留、insert 污染路径检测)
 - **新功能测试**:错误回调定制、行索引缓存(含语义对齐)、mmap 读取、Writer 自动提交、目录遍历/glob、SHA-256 哈希(含 NIST 标准向量)、异步 IO、文件监听、中文路径目录列表
 - **压力测试**:多线程并发读写(8 文件 × 5 轮)、高频小文件操作(500 文件创建/读取/删除)、LineIndex 随机访问压测(1000 次,验证 2~4 倍加速)、mmap 大文件反复读取、异步 IO 64 并发
 - **混合测试**:并发读写同一文件、文件监听 + 多文件写入、行索引 + 行编辑(索引失效与重建)、目录遍历 + 哈希 + 异步、原子写 + 哈希一致性、全功能综合场景、Writer 自动/手动提交混合
 - **性能用例**:带吞吐下限断言
 
-CI(GitHub Actions)在 Windows / Linux / macOS 三平台矩阵上执行同一套构建 + 测试,保证跨平台分支持续被编译验证(见 [.github/workflows/ci.yml](.github/workflows/ci.yml))。
+CI(GitHub Actions)在 Windows / Linux / macOS 三平台矩阵上执行同一套构建 + 测试,保证跨平台分支持续被编译验证(见 [.github/workflows/ci.yml](.github/workflows/ci.yml))。FileWatcher 相关用例在 macOS 上自动跳过(`#if defined(_WIN32) || defined(__linux__)` 门控)。
 
 ## 跨平台说明
 
@@ -238,6 +246,7 @@ CI(GitHub Actions)在 Windows / Linux / macOS 三平台矩阵上执行同一套�
 - **源码编码**:源文件保存为 UTF-8 with BOM;MSVC 下 CMakeLists 已配置 `/utf-8`(见 `target_compile_options`)。
 - **行号语义**:统一按 `\n` 计行(不处理 `\r\n` 的 `\r`,与 POSIX 工具一致);行号从 1 开始。
 - **换行语义**:文件末尾无 `\n` 时,最后一行计一行;末尾有 `\n` 时其后不再有空行(与 `wc -l` 一致)。
+- **mmap SIGBUS 契约**:`readMapped` 返回的 `view()` 在 `MemoryMappedFile` 存活期间有效。若映射期间文件被外部进程截断或删除,访问映射内存可能触发 SIGBUS(POSIX)或访问违规(Windows)。调用方需确保映射期间无外部截断操作,否则应使用 `readall`。
 
 ## 后续改进方向
 

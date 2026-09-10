@@ -110,6 +110,12 @@ Linux 用 `inotify`。回调接收路径和 `FileEvent`(Created/Modified/Deleted
   - P1-3 stop()/~Impl() join 前查 `worker.joinable()`, 线程构造失败路径不再 terminate;
   - P1-4 Writer::insertAt/insertBeforeLine/insertAfterLine 非法参数走 PrintError, 与 File:: 同名函数一致;
   - 琐碎: file.h LineIndex 注释修正(“二分查找 O(log N)” → “O(1) 直接寻址”); asyncWriteAll lambda 改移动捕获省一半内存峰值。
+- [x] **2026-09-10 契约补全 + 质量安全网(阶段 6)**——
+  - README 契约: FileWatcher 平台矩阵表(Win/Linux ✓, macOS ✗); mmap SIGBUS 契约(映射期间文件被外部截断会崩); readMapped 空文件语义; LineIndex mtime 粒度局限(1~2s 文件系统无法检出同尺寸同 mtime 内容变更); 性能数据标注“页缓存命中”;
+  - CI: 新增 Linux ASan+UBSan job(`.github/workflows/ci.yml`);
+  - Writer::isPoisoned() 公共查询接口, 调用方可主动检测而非仅靠 commit 失败;
+  - insert() TOCTOU 窗口注释(固有风险, 不值得修);
+  - poison 路径回归用例: InsertPoisonedOnDirectory(对目录路径 insert → poisoned → commit 拒绝); 测试数量 48 → 49。
 - [x] **2026-09-08 原子写掉电安全**——`writeAllAtomic` 新增 `durable` 参数(默认 true):
       写完临时文件后 `FlushFileBuffers`/`fsync` 刷盘再替换,消除"rename 成功但内容尚未落盘"
       的掉电窗口;`false` 保留原性能特征。临时文件名加 PID,多进程写同一目标不再撞名。

@@ -502,6 +502,15 @@ namespace
         EXPECT_EQ(w.view(), "content");
     }
 
+    // insert() 污染路径回归: 对目录路径调 insert, readall 失败 + exists 为真 → poisoned
+    TEST_F(FileTest, InsertPoisonedOnDirectory)
+    {
+        // kTestDir 是一个目录, readall 会失败, exists 返回 true
+        My::File::Writer w = My::File::insert(kTestDir);
+        EXPECT_TRUE(w.isPoisoned());
+        EXPECT_FALSE(w.commit()); // 拒绝提交, 不截断目录
+    }
+
     // ==================== 行编辑 ====================
 
     TEST_F(FileTest, InsertAt)

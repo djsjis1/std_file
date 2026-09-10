@@ -2364,6 +2364,8 @@ My::File::Writer My::File::insert(std::string_view filename)
     else if (exists(filename))
     {
         // 文件存在但读取失败 → 标记污染，阻止 commit() 截断原文件
+        // 注意: readall 失败与 exists() 之间存在极窄的 TOCTOU 窗口(文件恰好在此间隙被创建),
+        // 此时不会污染 → commit 会截断新文件。这是 insert 语义的固有风险,不值得修复。
         writer.pImpl->poisoned = true;
         PrintError("insert", filename, "文件存在但读取失败，Writer 已标记为不可提交");
     }
@@ -2374,6 +2376,11 @@ My::File::Writer &My::File::Writer::setAutoCommit(bool enable)
 {
     autoCommit_ = enable;
     return *this;
+}
+
+bool My::File::Writer::isPoisoned() const
+{
+    return pImpl->poisoned;
 }
 
 // ==================== 文件监听 ====================
