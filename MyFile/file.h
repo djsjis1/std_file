@@ -10,9 +10,92 @@
 #include <string_view>
 #include <chrono>
 #include <functional>
+#include <future>
 
 namespace My
 {
+    // ==================== 错误回调定制 ====================
+    // 全局错误处理回调。默认为打印 stderr；传 nullptr 恢复默认。
+    // 注意：setErrorHandler 非线程安全，应在程序启动时调用一次。
+    using ErrorHandler = void (*)(std::string_view func,
+                                  std::string_view filename,
+                                  std::string_view message);
+    void setErrorHandler(ErrorHandler handler);
+    ErrorHandler getErrorHandler();
+
+    // ==================== 行索引缓存 ====================
+    // 一次遍历记录每行起始字节偏移，后续 readLine 经二分查找 O(log N) 定位。
+    // 构造时记录 size/mtime，validate() 可检测文件外部变更。
+    class LineIndex
+    {
+    public:
+        explicit LineIndex(std::string_view filename);
+        size_t lineCount() const;
+        std::optional<std::uintmax_t> lineStart(size_t lineNumber) const;
+        bool validate(std::string_view filename) const;
+
+    private:
+        std::vector<std::uintmax_t> offsets_;
+        std::uintmax_t fileSize_ = 0;
+        std::chrono::system_clock::time_point mtime_;
+    };
+
+    // ==================== mmap 内存映射文件 ====================
+    // 零拷贝读取。mmap 失败（空文件/特殊文件/32 位地址空间不足）时返回空。
+    class MemoryMappedFile
+    {
+    public:
+        MemoryMappedFile() = default;
+        explicit MemoryMappedFile(std::string_view filename);
+        ~MemoryMappedFile();
+        MemoryMappedFile(const MemoryMappedFile &) = delete;
+        MemoryMappedFile &operator=(const MemoryMappedFile &) = delete;
+        MemoryMappedFile(MemoryMappedFile &&) noexcept;
+        MemoryMappedFile &operator=(MemoryMappedFile &&) noexcept;
+
+        const char *data() const;
+        size_t size() const;
+        bool isMapped() const;
+        std::string_view view() const;
+
+    private:
+#ifdef _WIN32
+        void *mappingHandle_ = nullptr;
+        void *viewBase_ = nullptr;
+#else
+        void *mappedAddr_ = nullptr;
+#endif
+        size_t mappedSize_ = 0;
+        void unmap();
+    };
+
+    // ==================== 文件监听 ====================
+    // Windows: ReadDirectoryChangesW; Linux: inotify; macOS: FSEvents(待实现)。
+    // 回调在内部线程执行，回调内避免长时间阻塞。
+    enum class FileEvent : uint8_t
+    {
+        Created,
+        Modified,
+        Deleted
+    };
+    class FileWatcher
+    {
+    public:
+        using Callback = std::function<void(std::string_view path, FileEvent event)>;
+        FileWatcher();
+        ~FileWatcher();
+        FileWatcher(const FileWatcher &) = delete;
+        FileWatcher &operator=(const FileWatcher &) = delete;
+
+        bool start(std::string_view path, Callback callback, bool recursive = true);
+        void stop();
+        bool isWatching() const;
+
+    private:
+        struct Impl;
+        std::unique_ptr<Impl> pImpl_;
+    };
+
     class File
     {
     public:
@@ -80,6 +163,26 @@ namespace My
         // 删除指定行
         static bool deleteLine(std::string_view filename, size_t lineNumber);
         static bool deleteLines(std::string_view filename, size_t startLine, size_t endLine); // 删除连续多行
+
+        // 使用行索引快速读取（O(log N) 定位 + 单次 seek+read）
+        static std::optional<std::string> readLine(std::string_view filename, size_t lineNumber, const LineIndex &index);
+
+        // mmap 零拷贝读取；mmap 失败时返回空，调用方可回退 readall
+        static std::optional<MemoryMappedFile> readMapped(std::string_view filename);
+
+        // 目录遍历
+        static std::vector<std::string> listFiles(std::string_view path); // 列出直接子文件（不含子目录）
+        static bool walk(std::string_view path,
+                         const std::function<bool(std::string_view path, bool isDir)> &callback);
+        static std::vector<std::string> globFiles(std::string_view path,
+                                                  std::string_view pattern); // 简单 glob 通配符
+
+        // 文件哈希（SHA-256，返回小写十六进制字符串）
+        static std::optional<std::string> fileHash(std::string_view filename);
+
+        // 异步 IO（内部线程池，返回 std::future）
+        static std::future<std::optional<std::string>> asyncReadall(std::string_view filename);
+        static std::future<bool> asyncWriteAll(std::string_view filename, std::string_view content);
     };
 
     // 链式写入构建器
@@ -120,9 +223,13 @@ namespace My
         // 预分配缓冲区大小
         Writer &reserve(size_t size);
 
+        // 启用/禁用析构自动提交（默认禁用）
+        Writer &setAutoCommit(bool enable);
+
     private:
         class Impl;
         std::unique_ptr<Impl> pImpl;
+        bool autoCommit_ = false;
 
         // 允许 File 类访问私有成员
         friend class File;

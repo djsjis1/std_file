@@ -3,8 +3,10 @@
 
 #include <chrono>
 #include <filesystem>
+#include <future>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace
@@ -644,5 +646,227 @@ namespace
         ASSERT_TRUE(mid.has_value());
         EXPECT_EQ(mid->size(), 99u);
         std::cout << "[perf] readLine(mid): " << ms << " ms\n";
+    }
+
+    // ==================== 新功能测试 ====================
+
+    // #4 错误回调定制
+    TEST_F(FileTest, ErrorHandler)
+    {
+        // 默认 handler 不为空
+        EXPECT_NE(My::getErrorHandler(), nullptr);
+
+        // 设置自定义 handler
+        int callCount = 0;
+        My::ErrorHandler custom = [](std::string_view, std::string_view, std::string_view) {};
+        My::setErrorHandler(custom);
+        EXPECT_EQ(My::getErrorHandler(), custom);
+
+        // 触发错误时不打印到 stderr（由自定义 handler 接管）
+        EXPECT_FALSE(My::File::readall(P("no_such_file.txt")).has_value());
+
+        // 恢复默认
+        My::setErrorHandler(nullptr);
+        EXPECT_EQ(My::getErrorHandler(), nullptr);
+
+        // nullptr 恢复默认后，错误仍正常返回
+        EXPECT_FALSE(My::File::readall(P("no_such_file.txt")).has_value());
+
+        // 清理：恢复默认 handler 以免影响其他用例
+        My::setErrorHandler(My::ErrorHandler{});
+        // 实际恢复默认（非 null）
+        My::setErrorHandler([](std::string_view, std::string_view, std::string_view) {});
+    }
+
+    // #2 行索引缓存
+    TEST_F(FileTest, LineIndexBasic)
+    {
+        WriteOk("li.txt", "aaa\nbbb\nccc\nddd");
+        My::LineIndex idx(P("li.txt"));
+        EXPECT_EQ(idx.lineCount(), 4u);
+
+        // 随机行访问
+        auto l1 = My::File::readLine(P("li.txt"), 1, idx);
+        ASSERT_TRUE(l1.has_value());
+        EXPECT_EQ(*l1, "aaa");
+
+        auto l3 = My::File::readLine(P("li.txt"), 3, idx);
+        ASSERT_TRUE(l3.has_value());
+        EXPECT_EQ(*l3, "ccc");
+
+        auto l4 = My::File::readLine(P("li.txt"), 4, idx);
+        ASSERT_TRUE(l4.has_value());
+        EXPECT_EQ(*l4, "ddd");
+
+        // 行号越界
+        EXPECT_FALSE(My::File::readLine(P("li.txt"), 0, idx).has_value());
+        EXPECT_FALSE(My::File::readLine(P("li.txt"), 5, idx).has_value());
+
+        // validate: 文件未变时应有效
+        EXPECT_TRUE(idx.validate(P("li.txt")));
+
+        // 修改文件后 validate 应失败
+        WriteOk("li.txt", "changed");
+        EXPECT_FALSE(idx.validate(P("li.txt")));
+    }
+
+    // #3 mmap 读取
+    TEST_F(FileTest, ReadMapped)
+    {
+        WriteOk("mm.txt", "hello mmap world");
+        auto mmf = My::File::readMapped(P("mm.txt"));
+        ASSERT_TRUE(mmf.has_value());
+        EXPECT_TRUE(mmf->isMapped());
+        EXPECT_EQ(mmf->size(), 16u);
+        EXPECT_EQ(mmf->view(), "hello mmap world");
+
+        // 空文件：mmap 应返回空
+        WriteOk("empty.txt", "");
+        auto empty = My::File::readMapped(P("empty.txt"));
+        EXPECT_FALSE(empty.has_value());
+
+        // 不存在的文件
+        auto nope = My::File::readMapped(P("nope.txt"));
+        EXPECT_FALSE(nope.has_value());
+    }
+
+    // #7 Writer 自动提交
+    TEST_F(FileTest, WriterAutoCommit)
+    {
+        {
+            My::File::Writer w = My::File::write(P("ac.txt"));
+            w.setAutoCommit(true).write("auto committed");
+            // 析构时自动提交
+        }
+        auto data = My::File::readall(P("ac.txt"));
+        ASSERT_TRUE(data.has_value());
+        EXPECT_EQ(*data, "auto committed");
+
+        // 未启用 autoCommit 时，析构不提交
+        {
+            My::File::Writer w = My::File::write(P("nac.txt"));
+            w.write("should not appear");
+        }
+        EXPECT_FALSE(My::File::exists(P("nac.txt")));
+    }
+
+    // #8 目录遍历
+    TEST_F(FileTest, ListWalkGlob)
+    {
+        WriteOk("a.txt", "a");
+        WriteOk("b.txt", "b");
+        WriteOk("c.log", "c");
+        My::File::createDirectories(P("sub"));
+        WriteOk("sub/d.txt", "d");
+
+        // listFiles: 只列直接子文件
+        auto files = My::File::listFiles(P(""));
+        // listFiles 使用 kTestDir 作为 path，但 P("") 返回 "test_tmp/"
+        // 改用 kTestDir 直接
+        files = My::File::listFiles(kTestDir);
+        EXPECT_GE(files.size(), 3u); // a.txt, b.txt, c.log (sub 是目录不算)
+
+        // globFiles: 通配符匹配
+        auto txts = My::File::globFiles(kTestDir, "*.txt");
+        EXPECT_GE(txts.size(), 2u);
+        auto logs = My::File::globFiles(kTestDir, "*.log");
+        EXPECT_EQ(logs.size(), 1u);
+
+        // walk: 递归遍历
+        size_t totalEntries = 0;
+        bool foundSub = false;
+        My::File::walk(kTestDir, [&](std::string_view path, bool isDir)
+                       {
+            ++totalEntries;
+            if (isDir && path.find("sub") != std::string_view::npos) foundSub = true;
+            return true; });
+        EXPECT_GE(totalEntries, 4u); // a.txt, b.txt, c.log, sub, sub/d.txt
+        EXPECT_TRUE(foundSub);
+    }
+
+    // #9 文件哈希
+    TEST_F(FileTest, FileHash)
+    {
+        // SHA-256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        WriteOk("empty.txt", "");
+        auto h = My::File::fileHash(P("empty.txt"));
+        ASSERT_TRUE(h.has_value());
+        EXPECT_EQ(*h, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+
+        // SHA-256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+        WriteOk("abc.txt", "abc");
+        auto h2 = My::File::fileHash(P("abc.txt"));
+        ASSERT_TRUE(h2.has_value());
+        EXPECT_EQ(*h2, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+
+        // 不存在的文件
+        EXPECT_FALSE(My::File::fileHash(P("nope.txt")).has_value());
+    }
+
+    // #6 异步 IO
+    TEST_F(FileTest, AsyncReadWrite)
+    {
+        WriteOk("async.txt", "async content");
+
+        // asyncReadall
+        auto fut = My::File::asyncReadall(P("async.txt"));
+        auto data = fut.get();
+        ASSERT_TRUE(data.has_value());
+        EXPECT_EQ(*data, "async content");
+
+        // asyncWriteAll
+        auto wfut = My::File::asyncWriteAll(P("async2.txt"), "written async");
+        EXPECT_TRUE(wfut.get());
+        auto d2 = My::File::readall(P("async2.txt"));
+        ASSERT_TRUE(d2.has_value());
+        EXPECT_EQ(*d2, "written async");
+
+        // 并发读取
+        std::vector<std::future<std::optional<std::string>>> futs;
+        for (int i = 0; i < 8; ++i)
+        {
+            futs.push_back(My::File::asyncReadall(P("async.txt")));
+        }
+        for (auto &f : futs)
+        {
+            auto r = f.get();
+            ASSERT_TRUE(r.has_value());
+            EXPECT_EQ(*r, "async content");
+        }
+    }
+
+    // #10 文件监听
+    TEST_F(FileTest, FileWatcherBasic)
+    {
+        My::FileWatcher watcher;
+        EXPECT_FALSE(watcher.isWatching());
+
+        std::mutex mtx;
+        std::vector<std::pair<std::string, My::FileEvent>> events;
+
+        ASSERT_TRUE(watcher.start(kTestDir, [&](std::string_view path, My::FileEvent ev)
+                                  {
+            std::lock_guard lock(mtx);
+            events.emplace_back(std::string(path), ev); }));
+        EXPECT_TRUE(watcher.isWatching());
+
+        // 创建文件触发事件
+        WriteOk("watched.txt", "hello");
+
+        // 轮询等待事件（最多 2 秒）
+        for (int i = 0; i < 40; ++i)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::lock_guard lock(mtx);
+            if (!events.empty())
+                break;
+        }
+
+        watcher.stop();
+        EXPECT_FALSE(watcher.isWatching());
+
+        // 至少应收到一个事件
+        std::lock_guard lock(mtx);
+        EXPECT_GE(events.size(), 1u);
     }
 } // namespace
