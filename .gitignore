@@ -1,0 +1,15 @@
+# 构建产物
+build/
+out/
+cmake-build-*/
+
+# 测试临时目录(测试用例的工作产物)
+test_tmp/
+
+# IDE
+.vscode/
+.qoder/
+*.user
+
+# 崩溃后可能残留的原子写临时文件
+*.tmp.*
