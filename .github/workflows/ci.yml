@@ -127,7 +127,7 @@ jobs:
 
       # ---- Test ----
       - name: Test
-        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --verbose
 
       # ---- 测试日志归档（失败时自动上传） ----
       - name: Upload Test Log (on failure)
