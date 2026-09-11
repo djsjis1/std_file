@@ -141,8 +141,24 @@ jobs:
             find build -type f -name "file_tests*"
             exit 1
           fi
-          "$TEST_BIN" 2>&1 | tee test-output.txt
-          exit ${PIPESTATUS[0]}
+          # 运行测试，保存输出
+          "$TEST_BIN" > test-output.txt 2>&1
+          EXIT_CODE=$?
+          # 将失败的测试输出作为 annotation（可通过 API 查看）
+          if [ $EXIT_CODE -ne 0 ]; then
+            # 提取 FAILED 行
+            while IFS= read -r line; do
+              echo "::error::$line"
+            done < <(grep -E "\[  FAILED  \]|FAILED TEST|Failure|error:|Expected|Actual" test-output.txt || true)
+            # 输出摘要
+            echo "::error::Test exit code: $EXIT_CODE"
+            grep -E "\[  PASSED  \]|\[  FAILED  \]" test-output.txt | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+          fi
+          # 也输出到最后 30 行
+          tail -30 test-output.txt
+          exit $EXIT_CODE
 
       # ---- 测试日志归档（失败时自动上传） ----
       - name: Upload Test Log (on failure)
