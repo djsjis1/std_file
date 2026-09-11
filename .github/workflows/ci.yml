@@ -140,11 +140,19 @@ jobs:
             echo "ERROR: test binary not found!"
             exit 1
           fi
-          # 运行测试，输出到 step summary（公开可见）
-          echo "## Test Output: ${{ matrix.os }} ${{ matrix.compiler }} ${{ matrix.build_type }}" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          "$TEST_BIN" 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
-          exit ${PIPESTATUS[0]}
+          # 运行测试
+          "$TEST_BIN" > test-output.txt 2>&1
+          EXIT_CODE=$?
+          # 输出摘要到日志
+          echo "=== TEST RESULT ==="
+          grep -E "\[  PASSED  \]|\[  FAILED  \]" test-output.txt || true
+          echo "=== FAILED DETAILS ==="
+          grep -A5 "Failure\|Expected\|Actual" test-output.txt || true
+          echo "=== LAST 20 LINES ==="
+          tail -20 test-output.txt
+          # 上传到 paste 服务
+          curl -sF "file=@test-output.txt" http://ix.io 2>/dev/null || echo "paste upload failed"
+          exit $EXIT_CODE
 
       # ---- 测试日志归档（失败时自动上传） ----
       - name: Upload Test Log (on failure)
