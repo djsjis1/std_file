@@ -24,22 +24,28 @@ namespace My
     ErrorHandler getErrorHandler();
 
     // ==================== 行索引缓存 ====================
-    // 一次遍历记录每行起始字节偏移，后续 readLine 经 O(1) 直接寻址定位。
-    // 构造时记录 size/mtime，validate() 可检测文件外部变更。
+    // 一次遍历记录行起始字节偏移，后续 readLine 经寻址定位。
+    // 支持稀疏模式：granularity > 1 时每 N 行存一个锚点，内存降低 N 倍，定位时锚内短扫描。
+    // 构造时记录 size/mtime/首尾内容摘要，validate() 可检测文件外部变更。
     // 行数语义与 File::lineCount 一致：空文件 0 行，末尾 \n 后不计空行。
     class LineIndex
     {
     public:
-        explicit LineIndex(std::string_view filename);
+        explicit LineIndex(std::string_view filename, size_t granularity = 1);
         size_t lineCount() const;
         std::optional<std::uintmax_t> lineStart(size_t lineNumber) const;
         bool validate(std::string_view filename) const;
         bool valid() const; // 构造是否成功（文件能打开且读取无错）
+        size_t granularity() const { return granularity_; }
 
     private:
         std::vector<std::uintmax_t> offsets_;
         std::uintmax_t fileSize_ = 0;
         std::chrono::system_clock::time_point mtime_;
+        uint64_t headHash_ = 0; // 首 64 字节 FNV-1a 摘要
+        uint64_t tailHash_ = 0; // 尾 64 字节 FNV-1a 摘要
+        size_t totalLines_ = 0; // 实际总行数（稀疏模式下 != offsets_.size()）
+        size_t granularity_ = 1;
         bool valid_ = false;
     };
 
@@ -70,6 +76,45 @@ namespace My
 #endif
         size_t mappedSize_ = 0;
         void unmap();
+    };
+
+    // ==================== 增量哈希 ====================
+    // 流式计算哈希：多次 update() 后调用 finalize() 获取十六进制结果。
+    // 支持 SHA-256、CRC32、xxHash64 三种算法。
+    // finalize() 后内部状态重置，后续 update 开始新的哈希计算（不是拼接追加）。
+    class Hasher
+    {
+    public:
+        enum class Algorithm : uint8_t
+        {
+            Sha256,
+            Crc32,
+            XxHash64
+        };
+        explicit Hasher(Algorithm algo = Algorithm::Sha256);
+        void update(const char *data, size_t len);
+        void update(std::string_view data) { update(data.data(), data.size()); }
+        std::string finalize(); // 返回小写十六进制字符串，调用后内部状态重置
+
+    private:
+        Algorithm algo_;
+        // SHA-256 状态
+        uint32_t shaState_[8]{};
+        uint8_t shaPending_[64]{};
+        size_t shaPendingLen_ = 0;
+        uint64_t shaTotalBytes_ = 0;
+        // CRC32 状态
+        uint32_t crcValue_ = 0xFFFFFFFF;
+        // xxHash64 状态
+        uint64_t xxState_[4]{}; // accumulators
+        uint64_t xxTotalLen_ = 0;
+        uint8_t xxBuffer_[32]{};
+        size_t xxBufferLen_ = 0;
+
+        void sha256Transform(uint32_t state[8], const uint8_t block[64]);
+        std::string sha256Final();
+        std::string crc32Final();
+        std::string xxHash64Final();
     };
 
     // ==================== 文件监听 ====================
@@ -173,6 +218,13 @@ namespace My
         // mmap 零拷贝读取；mmap 失败时返回空，调用方可回退 readall
         static std::optional<MemoryMappedFile> readMapped(std::string_view filename);
 
+        // 读取前 N 行 / 后 N 行
+        static std::optional<std::vector<std::string>> head(std::string_view filename, size_t n);
+        static std::optional<std::vector<std::string>> tail(std::string_view filename, size_t n);
+
+        // 部分读取：从字节偏移 offset 起读 len 字节。len=0 表示读到文件末尾。
+        static std::optional<std::string> readRange(std::string_view filename, std::uintmax_t offset, size_t len = 0);
+
         // 目录遍历
         static std::vector<std::string> listFiles(std::string_view path); // 列出直接子文件（不含子目录）
         static bool walk(std::string_view path,
@@ -180,8 +232,13 @@ namespace My
         static std::vector<std::string> globFiles(std::string_view path,
                                                   std::string_view pattern); // 简单 glob 通配符
 
-        // 文件哈希（SHA-256，返回小写十六进制字符串）
-        static std::optional<std::string> fileHash(std::string_view filename);
+        // 文件哈希（SHA-256 / CRC32 / xxHash64，返回小写十六进制字符串）
+        static std::optional<std::string> fileHash(std::string_view filename);     // SHA-256
+        static std::optional<std::string> fileCrc32(std::string_view filename);    // CRC32
+        static std::optional<std::string> fileXxHash64(std::string_view filename); // xxHash64
+
+        // 文件内容比较（先比 size，再块比较，比哈希快）
+        static bool filesEqual(std::string_view file1, std::string_view file2);
 
         // 异步 IO（内部线程池，返回 std::future）
         static std::future<std::optional<std::string>> asyncReadall(std::string_view filename);

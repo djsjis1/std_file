@@ -1560,4 +1560,448 @@ namespace
         EXPECT_EQ(*d4, "prefix_manual");
     }
 
+    // ==================== v1.2.0 新 API 测试 ====================
+
+    // head：读取前 N 行
+    TEST_F(FileTest, V120_HeadBasic)
+    {
+        // 生成 10 行文件
+        {
+            My::File::Writer w = My::File::write(P("head.txt"));
+            for (int i = 1; i <= 10; ++i)
+                w.writeLine("line_" + std::to_string(i));
+            ASSERT_TRUE(w.commit());
+        }
+
+        // 读前 3 行
+        auto r = My::File::head(P("head.txt"), 3);
+        ASSERT_TRUE(r.has_value());
+        ASSERT_EQ(r->size(), 3u);
+        EXPECT_EQ((*r)[0], "line_1");
+        EXPECT_EQ((*r)[1], "line_2");
+        EXPECT_EQ((*r)[2], "line_3");
+
+        // 读前 0 行
+        auto r0 = My::File::head(P("head.txt"), 0);
+        ASSERT_TRUE(r0.has_value());
+        EXPECT_TRUE(r0->empty());
+
+        // 读超过文件行数
+        auto rAll = My::File::head(P("head.txt"), 100);
+        ASSERT_TRUE(rAll.has_value());
+        EXPECT_EQ(rAll->size(), 10u);
+
+        // 不存在的文件
+        auto rBad = My::File::head(P("no_such.txt"), 5);
+        EXPECT_FALSE(rBad.has_value());
+    }
+
+    // tail：读取后 N 行
+    TEST_F(FileTest, V120_TailBasic)
+    {
+        // 生成 10 行文件（每行以 \n 结尾）
+        {
+            My::File::Writer w = My::File::write(P("tail.txt"));
+            for (int i = 1; i <= 10; ++i)
+                w.writeLine("line_" + std::to_string(i));
+            ASSERT_TRUE(w.commit());
+        }
+
+        // 读后 3 行
+        auto r = My::File::tail(P("tail.txt"), 3);
+        ASSERT_TRUE(r.has_value());
+        ASSERT_EQ(r->size(), 3u);
+        EXPECT_EQ((*r)[0], "line_8");
+        EXPECT_EQ((*r)[1], "line_9");
+        EXPECT_EQ((*r)[2], "line_10");
+
+        // 读后 0 行
+        auto r0 = My::File::tail(P("tail.txt"), 0);
+        ASSERT_TRUE(r0.has_value());
+        EXPECT_TRUE(r0->empty());
+
+        // 读超过文件行数
+        auto rAll = My::File::tail(P("tail.txt"), 100);
+        ASSERT_TRUE(rAll.has_value());
+        EXPECT_EQ(rAll->size(), 10u);
+
+        // 空文件
+        WriteOk("empty.txt", "");
+        auto rEmpty = My::File::tail(P("empty.txt"), 5);
+        ASSERT_TRUE(rEmpty.has_value());
+        EXPECT_TRUE(rEmpty->empty());
+    }
+
+    // tail：文件不以换行结尾
+    TEST_F(FileTest, V120_TailNoTrailingNewline)
+    {
+        // 写入无尾换行的内容
+        WriteOk("tail_nonl.txt", "aaa\nbbb\nccc");
+
+        auto r = My::File::tail(P("tail_nonl.txt"), 2);
+        ASSERT_TRUE(r.has_value());
+        ASSERT_EQ(r->size(), 2u);
+        EXPECT_EQ((*r)[0], "bbb");
+        EXPECT_EQ((*r)[1], "ccc");
+
+        // 读全部
+        auto rAll = My::File::tail(P("tail_nonl.txt"), 10);
+        ASSERT_TRUE(rAll.has_value());
+        ASSERT_EQ(rAll->size(), 3u);
+        EXPECT_EQ((*rAll)[0], "aaa");
+    }
+
+    // readRange：部分读取
+    TEST_F(FileTest, V120_ReadRangeBasic)
+    {
+        WriteOk("range.txt", "0123456789ABCDEF");
+
+        // 从偏移 5 读 4 字节
+        auto r = My::File::readRange(P("range.txt"), 5, 4);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(*r, "5678");
+
+        // 从偏移 0 读到末尾（len=0）
+        auto rAll = My::File::readRange(P("range.txt"), 0, 0);
+        ASSERT_TRUE(rAll.has_value());
+        EXPECT_EQ(*rAll, "0123456789ABCDEF");
+
+        // 从偏移 10 读到末尾
+        auto rEnd = My::File::readRange(P("range.txt"), 10, 0);
+        ASSERT_TRUE(rEnd.has_value());
+        EXPECT_EQ(*rEnd, "ABCDEF");
+
+        // 偏移超出文件
+        auto rBad = My::File::readRange(P("range.txt"), 100, 5);
+        EXPECT_FALSE(rBad.has_value());
+
+        // len 超出文件范围应截断
+        auto rClip = My::File::readRange(P("range.txt"), 14, 100);
+        ASSERT_TRUE(rClip.has_value());
+        EXPECT_EQ(*rClip, "EF");
+    }
+
+    // filesEqual：文件比较
+    TEST_F(FileTest, V120_FilesEqualBasic)
+    {
+        WriteOk("eq_a.txt", "hello world");
+        WriteOk("eq_b.txt", "hello world");
+        WriteOk("eq_c.txt", "different");
+
+        EXPECT_TRUE(My::File::filesEqual(P("eq_a.txt"), P("eq_b.txt")));
+        EXPECT_FALSE(My::File::filesEqual(P("eq_a.txt"), P("eq_c.txt")));
+
+        // 自身比较
+        EXPECT_TRUE(My::File::filesEqual(P("eq_a.txt"), P("eq_a.txt")));
+
+        // 空文件
+        WriteOk("eq_empty1.txt", "");
+        WriteOk("eq_empty2.txt", "");
+        EXPECT_TRUE(My::File::filesEqual(P("eq_empty1.txt"), P("eq_empty2.txt")));
+        EXPECT_FALSE(My::File::filesEqual(P("eq_a.txt"), P("eq_empty1.txt")));
+
+        // 不存在的文件
+        EXPECT_FALSE(My::File::filesEqual(P("eq_a.txt"), P("no_such.txt")));
+    }
+
+    // filesEqual：大文件块比较
+    TEST_F(FileTest, V120_FilesEqualLarge)
+    {
+        const std::string big(256 * 1024, 'X'); // 256KB
+        WriteOk("big_a.bin", big);
+        WriteOk("big_b.bin", big);
+        EXPECT_TRUE(My::File::filesEqual(P("big_a.bin"), P("big_b.bin")));
+
+        // 修改最后一个字节
+        std::string modified = big;
+        modified.back() = 'Y';
+        WriteOk("big_c.bin", modified);
+        EXPECT_FALSE(My::File::filesEqual(P("big_a.bin"), P("big_c.bin")));
+    }
+
+    // fileCrc32：CRC32 哈希
+    TEST_F(FileTest, V120_FileCrc32Basic)
+    {
+        WriteOk("crc.txt", "hello");
+        auto h = My::File::fileCrc32(P("crc.txt"));
+        ASSERT_TRUE(h.has_value());
+        EXPECT_EQ(h->size(), 8u); // CRC32 = 4 bytes = 8 hex chars
+
+        // 同一内容哈希一致
+        WriteOk("crc2.txt", "hello");
+        auto h2 = My::File::fileCrc32(P("crc2.txt"));
+        ASSERT_TRUE(h2.has_value());
+        EXPECT_EQ(*h, *h2);
+
+        // 不同内容哈希不同
+        WriteOk("crc3.txt", "world");
+        auto h3 = My::File::fileCrc32(P("crc3.txt"));
+        ASSERT_TRUE(h3.has_value());
+        EXPECT_NE(*h, *h3);
+
+        // 空文件
+        WriteOk("crc_empty.txt", "");
+        auto he = My::File::fileCrc32(P("crc_empty.txt"));
+        ASSERT_TRUE(he.has_value());
+        EXPECT_EQ(*he, "00000000");
+    }
+
+    // fileXxHash64：xxHash64 哈希
+    TEST_F(FileTest, V120_FileXxHash64Basic)
+    {
+        WriteOk("xxh.txt", "hello");
+        auto h = My::File::fileXxHash64(P("xxh.txt"));
+        ASSERT_TRUE(h.has_value());
+        EXPECT_EQ(h->size(), 16u); // xxHash64 = 8 bytes = 16 hex chars
+
+        // 同一内容哈希一致
+        WriteOk("xxh2.txt", "hello");
+        auto h2 = My::File::fileXxHash64(P("xxh2.txt"));
+        ASSERT_TRUE(h2.has_value());
+        EXPECT_EQ(*h, *h2);
+
+        // 不同内容哈希不同
+        WriteOk("xxh3.txt", "world");
+        auto h3 = My::File::fileXxHash64(P("xxh3.txt"));
+        ASSERT_TRUE(h3.has_value());
+        EXPECT_NE(*h, *h3);
+    }
+
+    // Hasher：增量哈希 — SHA-256
+    TEST_F(FileTest, V120_HasherSha256)
+    {
+        // 一次性计算
+        WriteOk("hsha.txt", "hello world");
+        auto oneShot = My::File::fileHash(P("hsha.txt"));
+        ASSERT_TRUE(oneShot.has_value());
+
+        // 增量计算（分两次 update）
+        My::Hasher hasher(My::Hasher::Algorithm::Sha256);
+        hasher.update("hello ");
+        hasher.update("world");
+        auto incremental = hasher.finalize();
+
+        EXPECT_EQ(incremental, *oneShot);
+        EXPECT_EQ(incremental.size(), 64u);
+    }
+
+    // Hasher：增量哈希 — CRC32
+    TEST_F(FileTest, V120_HasherCrc32)
+    {
+        WriteOk("hcrc.txt", "test data");
+        auto oneShot = My::File::fileCrc32(P("hcrc.txt"));
+        ASSERT_TRUE(oneShot.has_value());
+
+        My::Hasher hasher(My::Hasher::Algorithm::Crc32);
+        hasher.update("test ");
+        hasher.update("data");
+        auto incremental = hasher.finalize();
+
+        EXPECT_EQ(incremental, *oneShot);
+        EXPECT_EQ(incremental.size(), 8u);
+
+        // 官方向量：CRC32("123456789") = 0xcbf43926
+        My::Hasher h2(My::Hasher::Algorithm::Crc32);
+        h2.update("123456789");
+        EXPECT_EQ(h2.finalize(), "cbf43926");
+    }
+
+    // Hasher：增量哈希 — xxHash64
+    TEST_F(FileTest, V120_HasherXxHash64)
+    {
+        WriteOk("hxxh.txt", "test data 12345");
+        auto oneShot = My::File::fileXxHash64(P("hxxh.txt"));
+        ASSERT_TRUE(oneShot.has_value());
+
+        My::Hasher hasher(My::Hasher::Algorithm::XxHash64);
+        hasher.update("test ");
+        hasher.update("data ");
+        hasher.update("12345");
+        auto incremental = hasher.finalize();
+
+        EXPECT_EQ(incremental, *oneShot);
+        EXPECT_EQ(incremental.size(), 16u);
+
+        // 官方向量：xxHash64("") = 2be48486f6c12fe5, xxHash64("abc") = 7cb59da24f152cc3
+        My::Hasher h2(My::Hasher::Algorithm::XxHash64);
+        h2.update("");
+        EXPECT_EQ(h2.finalize(), "2be48486f6c12fe5");
+
+        My::Hasher h3(My::Hasher::Algorithm::XxHash64);
+        h3.update("abc");
+        EXPECT_EQ(h3.finalize(), "7cb59da24f152cc3");
+    }
+
+    // Hasher：finalize 后开始新计算（不是拼接追加）
+    TEST_F(FileTest, V120_HasherResetAfterFinalize)
+    {
+        My::Hasher hasher(My::Hasher::Algorithm::Crc32);
+        hasher.update("abc");
+        auto h1 = hasher.finalize();
+
+        // finalize 后内部重置，继续 update 开始新计算，同样内容应得到相同结果
+        hasher.update("abc");
+        auto h2 = hasher.finalize();
+        EXPECT_EQ(h1, h2);
+
+        // 拼接不同内容应得到不同结果（确认不是追加）
+        hasher.update("xyz");
+        auto h3 = hasher.finalize();
+        EXPECT_NE(h1, h3);
+    }
+
+    // Hasher：string_view 重载
+    TEST_F(FileTest, V120_HasherStringView)
+    {
+        My::Hasher h1(My::Hasher::Algorithm::Sha256);
+        std::string_view sv = "hello world";
+        h1.update(sv);
+        auto r1 = h1.finalize();
+
+        My::Hasher h2(My::Hasher::Algorithm::Sha256);
+        h2.update("hello ");
+        h2.update("world");
+        auto r2 = h2.finalize();
+
+        EXPECT_EQ(r1, r2);
+    }
+
+    // v1.2.0 综合场景：head + tail + readRange + filesEqual + 哈希
+    TEST_F(FileTest, V120_AllNewApisCombined)
+    {
+        // 生成 50 行文件
+        {
+            My::File::Writer w = My::File::write(P("combo.txt"));
+            for (int i = 1; i <= 50; ++i)
+                w.writeLine("row_" + std::to_string(i));
+            ASSERT_TRUE(w.commit());
+        }
+
+        // head + tail 覆盖首尾
+        auto h = My::File::head(P("combo.txt"), 5);
+        ASSERT_TRUE(h.has_value());
+        EXPECT_EQ((*h)[0], "row_1");
+        EXPECT_EQ((*h)[4], "row_5");
+
+        auto t = My::File::tail(P("combo.txt"), 5);
+        ASSERT_TRUE(t.has_value());
+        EXPECT_EQ((*t)[0], "row_46");
+        EXPECT_EQ((*t)[4], "row_50");
+
+        // readRange 读取字节片段
+        auto rr = My::File::readRange(P("combo.txt"), 0, 5);
+        ASSERT_TRUE(rr.has_value());
+        EXPECT_EQ(*rr, "row_1");
+
+        // filesEqual：复制后应相等
+        ASSERT_TRUE(My::File::copy(P("combo.txt"), P("combo_copy.txt")));
+        EXPECT_TRUE(My::File::filesEqual(P("combo.txt"), P("combo_copy.txt")));
+
+        // 三种哈希一致性：fileHash vs Hasher
+        auto sha = My::File::fileHash(P("combo.txt"));
+        auto crc = My::File::fileCrc32(P("combo.txt"));
+        auto xxh = My::File::fileXxHash64(P("combo.txt"));
+        ASSERT_TRUE(sha.has_value());
+        ASSERT_TRUE(crc.has_value());
+        ASSERT_TRUE(xxh.has_value());
+
+        My::Hasher hSha(My::Hasher::Algorithm::Sha256);
+        My::Hasher hCrc(My::Hasher::Algorithm::Crc32);
+        My::Hasher hXxh(My::Hasher::Algorithm::XxHash64);
+        auto content = My::File::readall(P("combo.txt"));
+        ASSERT_TRUE(content.has_value());
+        hSha.update(*content);
+        hCrc.update(*content);
+        hXxh.update(*content);
+        EXPECT_EQ(hSha.finalize(), *sha);
+        EXPECT_EQ(hCrc.finalize(), *crc);
+        EXPECT_EQ(hXxh.finalize(), *xxh);
+
+        std::cout << "[v1.2.0] all new APIs combined: OK\n";
+    }
+
+    // ==================== 审查修复回归测试 ====================
+
+    // P0-1 回归：稀疏索引 readLine 定位正确性
+    TEST_F(FileTest, Fix_SparseIndexReadLine)
+    {
+        constexpr size_t kLines = 200;
+        // 生成 200 行文件，每行 ~100 字节
+        {
+            My::File::Writer w = My::File::write(P("sparse.txt"));
+            for (size_t i = 1; i <= kLines; ++i)
+            {
+                // 每行格式：line_001_padding...padding
+                std::string line = "line_" + std::to_string(i);
+                line.resize(100, '.');
+                w.writeLine(line);
+            }
+            ASSERT_TRUE(w.commit());
+        }
+
+        // 稠密索引作为基准
+        My::LineIndex denseIdx(P("sparse.txt"), 1);
+        ASSERT_TRUE(denseIdx.valid());
+        ASSERT_EQ(denseIdx.lineCount(), kLines);
+
+        // 稀疏索引 granularity=64
+        My::LineIndex sparseIdx(P("sparse.txt"), 64);
+        ASSERT_TRUE(sparseIdx.valid());
+        ASSERT_EQ(sparseIdx.lineCount(), kLines);
+        EXPECT_EQ(sparseIdx.granularity(), 64u);
+
+        // 随机抽取多行对比：稠密 vs 稀疏 必须一致
+        std::vector<size_t> testLines = {1, 2, 50, 64, 65, 66, 100, 128, 129, 130, 199, 200};
+        for (size_t ln : testLines)
+        {
+            auto dense = My::File::readLine(P("sparse.txt"), ln, denseIdx);
+            auto sparse = My::File::readLine(P("sparse.txt"), ln, sparseIdx);
+            ASSERT_TRUE(dense.has_value()) << "line " << ln;
+            ASSERT_TRUE(sparse.has_value()) << "line " << ln;
+            EXPECT_EQ(*dense, *sparse) << "mismatch at line " << ln;
+        }
+
+        // 稀疏索引 granularity=2（最小稀疏）
+        My::LineIndex sparse2(P("sparse.txt"), 2);
+        for (size_t ln : testLines)
+        {
+            auto dense = My::File::readLine(P("sparse.txt"), ln, denseIdx);
+            auto s2 = My::File::readLine(P("sparse.txt"), ln, sparse2);
+            ASSERT_TRUE(s2.has_value()) << "line " << ln;
+            EXPECT_EQ(*dense, *s2) << "mismatch at line " << ln << " (granularity=2)";
+        }
+    }
+
+    // P0-2 回归：tail() 文件以 \n 开头时首行不丢失
+    TEST_F(FileTest, Fix_TailLeadingNewline)
+    {
+        // 文件内容：\nfoo\n （首行为空，第二行 foo）
+        WriteOk("tail_ln.txt", "\nfoo\n");
+
+        auto r = My::File::tail(P("tail_ln.txt"), 2);
+        ASSERT_TRUE(r.has_value());
+        ASSERT_EQ(r->size(), 2u);
+        EXPECT_EQ((*r)[0], ""); // 首行是空行
+        EXPECT_EQ((*r)[1], "foo");
+
+        // 只取 1 行
+        auto r1 = My::File::tail(P("tail_ln.txt"), 1);
+        ASSERT_TRUE(r1.has_value());
+        ASSERT_EQ(r1->size(), 1u);
+        EXPECT_EQ((*r1)[0], "foo");
+
+        // 文件只有一个 \n
+        WriteOk("tail_single_nl.txt", "\n");
+        auto rs = My::File::tail(P("tail_single_nl.txt"), 1);
+        ASSERT_TRUE(rs.has_value());
+        ASSERT_EQ(rs->size(), 1u);
+        EXPECT_EQ((*rs)[0], ""); // 空行
+
+        // 文件只有 \n，取 5 行
+        auto rs5 = My::File::tail(P("tail_single_nl.txt"), 5);
+        ASSERT_TRUE(rs5.has_value());
+        ASSERT_EQ(rs5->size(), 1u);
+        EXPECT_EQ((*rs5)[0], "");
+    }
+
 } // namespace

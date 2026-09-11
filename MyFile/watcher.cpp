@@ -30,25 +30,46 @@ bool My::FileWatcher::isWatching() const { return pImpl_ && pImpl_->running; }
 
 void My::FileWatcher::stop()
 {
-    if (!pImpl_ || !pImpl_->running) return;
+    if (!pImpl_ || !pImpl_->running)
+        return;
     pImpl_->running = false;
 #ifdef _WIN32
-    if (pImpl_->stopEvent) SetEvent(pImpl_->stopEvent);
-    if (pImpl_->dirHandle != INVALID_HANDLE_VALUE) CancelIoEx(pImpl_->dirHandle, nullptr);
+    if (pImpl_->stopEvent)
+        SetEvent(pImpl_->stopEvent);
+    if (pImpl_->dirHandle != INVALID_HANDLE_VALUE)
+        CancelIoEx(pImpl_->dirHandle, nullptr);
 #elif defined(__linux__)
-    if (pImpl_->inotifyFd >= 0) { ::close(pImpl_->inotifyFd); pImpl_->inotifyFd = -1; }
+    if (pImpl_->inotifyFd >= 0)
+    {
+        ::close(pImpl_->inotifyFd);
+        pImpl_->inotifyFd = -1;
+    }
 #endif
-    if (pImpl_->worker.joinable()) pImpl_->worker.join();
+    if (pImpl_->worker.joinable())
+        pImpl_->worker.join();
 #ifdef _WIN32
-    if (pImpl_->dirHandle != INVALID_HANDLE_VALUE) { CloseHandle(pImpl_->dirHandle); pImpl_->dirHandle = INVALID_HANDLE_VALUE; }
-    if (pImpl_->stopEvent) { CloseHandle(pImpl_->stopEvent); pImpl_->stopEvent = nullptr; }
-    if (pImpl_->overlapEvent) { CloseHandle(pImpl_->overlapEvent); pImpl_->overlapEvent = nullptr; }
+    if (pImpl_->dirHandle != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(pImpl_->dirHandle);
+        pImpl_->dirHandle = INVALID_HANDLE_VALUE;
+    }
+    if (pImpl_->stopEvent)
+    {
+        CloseHandle(pImpl_->stopEvent);
+        pImpl_->stopEvent = nullptr;
+    }
+    if (pImpl_->overlapEvent)
+    {
+        CloseHandle(pImpl_->overlapEvent);
+        pImpl_->overlapEvent = nullptr;
+    }
 #endif
 }
 
 bool My::FileWatcher::start(std::string_view path, Callback callback, bool recursive)
 {
-    if (isWatching()) return false;
+    if (isWatching())
+        return false;
     pImpl_->callback = std::move(callback);
     pImpl_->running = true;
     const std::filesystem::path dirPath = ToPath(path);
@@ -57,12 +78,36 @@ bool My::FileWatcher::start(std::string_view path, Callback callback, bool recur
     pImpl_->dirHandle = CreateFileW(dirPath.c_str(), FILE_LIST_DIRECTORY,
                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                     nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
-    if (pImpl_->dirHandle == INVALID_HANDLE_VALUE) { pImpl_->running = false; return false; }
+    if (pImpl_->dirHandle == INVALID_HANDLE_VALUE)
+    {
+        pImpl_->running = false;
+        return false;
+    }
     pImpl_->stopEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
     pImpl_->overlapEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    if (!pImpl_->stopEvent || !pImpl_->overlapEvent)
+    {
+        CloseHandle(pImpl_->dirHandle);
+        pImpl_->dirHandle = INVALID_HANDLE_VALUE;
+        if (pImpl_->stopEvent)
+        {
+            CloseHandle(pImpl_->stopEvent);
+            pImpl_->stopEvent = nullptr;
+        }
+        if (pImpl_->overlapEvent)
+        {
+            CloseHandle(pImpl_->overlapEvent);
+            pImpl_->overlapEvent = nullptr;
+        }
+        pImpl_->running = false;
+        return false;
+    }
 
     auto *impl = pImpl_.get();
-    pImpl_->worker = std::thread([impl, recursive]() {
+    try
+    {
+        pImpl_->worker = std::thread([impl, recursive]()
+                                     {
         constexpr size_t kBufSize = 8192;
         alignas(FILE_NOTIFY_INFORMATION) char buf[kBufSize];
         OVERLAPPED ov{};
@@ -105,37 +150,64 @@ bool My::FileWatcher::start(std::string_view path, Callback callback, bool recur
                 p += info->NextEntryOffset;
             }
         } });
+    }
+    catch (...)
+    {
+        stop();
+        pImpl_->running = false;
+        return false;
+    }
 #elif defined(__linux__)
     pImpl_->inotifyFd = inotify_init1(IN_NONBLOCK);
-    if (pImpl_->inotifyFd < 0) { pImpl_->running = false; return false; }
+    if (pImpl_->inotifyFd < 0)
+    {
+        pImpl_->running = false;
+        return false;
+    }
     const int wd = inotify_add_watch(pImpl_->inotifyFd, dirPath.c_str(),
                                      IN_CREATE | IN_MODIFY | IN_DELETE | (recursive ? IN_MOVED_FROM | IN_MOVED_TO : 0));
-    if (wd < 0) { ::close(pImpl_->inotifyFd); pImpl_->running = false; return false; }
+    if (wd < 0)
+    {
+        ::close(pImpl_->inotifyFd);
+        pImpl_->running = false;
+        return false;
+    }
 
     auto *impl = pImpl_.get();
-    pImpl_->worker = std::thread([impl]() {
-        constexpr size_t kBufSize = 4096;
-        alignas(struct inotify_event) char buf[kBufSize];
-        struct pollfd pfd{};
-        while (impl->running)
-        {
-            pfd.fd = impl->inotifyFd; pfd.events = POLLIN;
-            if (poll(&pfd, 1, 200) <= 0) continue;
-            const ssize_t len = read(impl->inotifyFd, buf, kBufSize);
-            if (len <= 0) break;
-            for (char *p = buf; p < buf + len && impl->running; )
+    try
+    {
+        pImpl_->worker = std::thread([impl]()
+                                     {
+            constexpr size_t kBufSize = 4096;
+            alignas(struct inotify_event) char buf[kBufSize];
+            struct pollfd pfd{};
+            while (impl->running)
             {
-                auto *event = reinterpret_cast<struct inotify_event *>(p);
-                if (event->len > 0 && impl->callback)
+                pfd.fd = impl->inotifyFd; pfd.events = POLLIN;
+                if (poll(&pfd, 1, 200) <= 0) continue;
+                const ssize_t len = read(impl->inotifyFd, buf, kBufSize);
+                if (len <= 0) break;
+                for (char *p = buf; p < buf + len && impl->running; )
                 {
-                    FileEvent ev = FileEvent::Modified;
-                    if (event->mask & IN_CREATE) ev = FileEvent::Created;
-                    else if (event->mask & IN_DELETE) ev = FileEvent::Deleted;
-                    impl->callback(event->name, ev);
+                    auto *event = reinterpret_cast<struct inotify_event *>(p);
+                    if (event->len > 0 && impl->callback)
+                    {
+                        FileEvent ev = FileEvent::Modified;
+                        if (event->mask & IN_CREATE) ev = FileEvent::Created;
+                        else if (event->mask & IN_DELETE) ev = FileEvent::Deleted;
+                        impl->callback(event->name, ev);
+                    }
+                    p += sizeof(struct inotify_event) + event->len;
                 }
-                p += sizeof(struct inotify_event) + event->len;
-            }
-        } });
+            } });
+    }
+    catch (...)
+    {
+        ::close(pImpl_->inotifyFd);
+        pImpl_->inotifyFd = -1;
+        pImpl_->running = false;
+        return false;
+    }
 #else
     pImpl_->running = false;
     return false;

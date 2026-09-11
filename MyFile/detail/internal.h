@@ -144,6 +144,9 @@ namespace My::detail
     // ==================== 路径转换 ====================
     std::filesystem::path ToPath(std::string_view s);
 
+    // 检查路径是否为目录（用于 readall/readBytes 统一跨平台报错）
+    bool IsDirectory(const std::filesystem::path &p);
+
     // ==================== 错误报告 ====================
     extern My::ErrorHandler g_errorHandler;
 
@@ -275,7 +278,8 @@ namespace My::detail
             auto fut = task->get_future();
             {
                 std::lock_guard lock(mutex_);
-                tasks_.push([task]() { (*task)(); });
+                tasks_.push([task]()
+                            { (*task)(); });
             }
             cv_.notify_one();
             return fut;

@@ -113,6 +113,17 @@ namespace My::detail
 #endif
     }
 
+    bool IsDirectory(const std::filesystem::path &p)
+    {
+#ifdef _WIN32
+        const DWORD attr = ::GetFileAttributesW(p.c_str());
+        return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#else
+        struct stat st;
+        return ::stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+    }
+
     // ==================== 错误报告 ====================
     void DefaultErrorHandler(std::string_view func, std::string_view filename, std::string_view message)
     {
