@@ -126,11 +126,8 @@ namespace My::detail
 
     std::chrono::system_clock::time_point FileClockToSystem(std::filesystem::file_time_type ft)
     {
-#if defined(__cpp_lib_chrono) && __cpp_lib_chrono >= 201907L
-        // C++20 clock_cast 可用
-        return std::chrono::clock_cast<std::chrono::system_clock>(ft);
-#else
-        // 兼容方案：用两个 clock 的 now() tick 差值做 epoch 偏移
+        // 跨编译器兼容方案：用两个 clock 的 now() tick 差值做 epoch 偏移
+        // 不依赖 C++20 clock_cast（GCC 13 / Clang 18 的 libstdc++ 尚未实现）
         // 精度取决于 duration 分辨率，对文件 mtime 比较完全够用
         using namespace std::chrono;
         const auto fileNow = std::filesystem::file_time_type::clock::now();
@@ -143,7 +140,6 @@ namespace My::detail
             ft.time_since_epoch()).count();
         return system_clock::time_point(
             system_clock::duration(ftTicks + offsetTicks));
-#endif
     }
 
     // ==================== 错误报告 ====================
