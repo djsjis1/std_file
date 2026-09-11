@@ -143,15 +143,21 @@ jobs:
           # 运行测试
           "$TEST_BIN" > test-output.txt 2>&1
           EXIT_CODE=$?
-          # 输出摘要到日志
-          echo "=== TEST RESULT ==="
-          grep -E "\[  PASSED  \]|\[  FAILED  \]" test-output.txt || true
-          echo "=== FAILED DETAILS ==="
-          grep -A5 "Failure\|Expected\|Actual" test-output.txt || true
-          echo "=== LAST 20 LINES ==="
-          tail -20 test-output.txt
-          # 上传到 paste 服务
-          curl -sF "file=@test-output.txt" http://ix.io 2>/dev/null || echo "paste upload failed"
+          # 用 ::error:: 输出关键信息（不在管道中，确保 GitHub 能处理）
+          echo "::error::Test exit code: $EXIT_CODE"
+          # PASSED/FAILED 摘要
+          SUMMARY=$(grep -E "\[  PASSED  \]|\[  FAILED  \]" test-output.txt || true)
+          if [ -n "$SUMMARY" ]; then
+            while IFS= read -r line; do echo "::error::$line"; done <<< "$SUMMARY"
+          fi
+          # 失败详情
+          FAIL_DETAILS=$(grep -A3 "Failure\|Expected\|Actual" test-output.txt || true)
+          if [ -n "$FAIL_DETAILS" ]; then
+            while IFS= read -r line; do echo "::error::$line"; done <<< "$FAIL_DETAILS"
+          fi
+          # 最后 5 行
+          LAST_LINES=$(tail -5 test-output.txt)
+          while IFS= read -r line; do echo "::error::$line"; done <<< "$LAST_LINES"
           exit $EXIT_CODE
 
       # ---- 测试日志归档（失败时自动上传） ----
