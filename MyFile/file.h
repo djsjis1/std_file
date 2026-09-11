@@ -27,6 +27,7 @@ namespace My
     // 一次遍历记录行起始字节偏移，后续 readLine 经寻址定位。
     // 支持稀疏模式：granularity > 1 时每 N 行存一个锚点，内存降低 N 倍，定位时锚内短扫描。
     // 构造时记录 size/mtime/首尾内容摘要，validate() 可检测文件外部变更。
+    // validate() 内部有 1 秒短时缓存，避免高频 readLine 场景每次触发系统调用。
     // 行数语义与 File::lineCount 一致：空文件 0 行，末尾 \n 后不计空行。
     class LineIndex
     {
@@ -47,6 +48,9 @@ namespace My
         size_t totalLines_ = 0; // 实际总行数（稀疏模式下 != offsets_.size()）
         size_t granularity_ = 1;
         bool valid_ = false;
+        // validate 短时缓存（避免每次 readLine 触发 5 个系统调用）
+        mutable bool cachedValid_ = false;
+        mutable std::chrono::steady_clock::time_point cachedTime_;
     };
 
     // ==================== mmap 内存映射文件 ====================

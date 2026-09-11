@@ -717,8 +717,9 @@ namespace
         // validate: 文件未变时应有效
         EXPECT_TRUE(idx.validate(P("li.txt")));
 
-        // 修改文件后 validate 应失败
+        // 修改文件后 validate 应失败（先等缓存窗口过期）
         WriteOk("li.txt", "changed");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
         EXPECT_FALSE(idx.validate(P("li.txt")));
     }
 
@@ -1355,7 +1356,8 @@ namespace
         // 行编辑：在第 50 行前插入
         ASSERT_TRUE(My::File::insertBeforeLine(P("mix_idx.txt"), 50, "inserted_line\n"));
 
-        // 索引应失效（文件已修改）
+        // 索引应失效（文件已修改，等缓存窗口过期）
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
         EXPECT_FALSE(idx.validate(P("mix_idx.txt")));
 
         // 重建索引
@@ -1373,6 +1375,7 @@ namespace
 
         // 删除行后索引再次失效
         ASSERT_TRUE(My::File::deleteLine(P("mix_idx.txt"), 50));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
         EXPECT_FALSE(idx2.validate(P("mix_idx.txt")));
 
         My::LineIndex idx3(P("mix_idx.txt"));
@@ -1822,14 +1825,14 @@ namespace
         EXPECT_EQ(incremental, *oneShot);
         EXPECT_EQ(incremental.size(), 16u);
 
-        // 官方向量：xxHash64("") = 2be48486f6c12fe5, xxHash64("abc") = 7cb59da24f152cc3
+        // 官方向量：xxHash64("") = ef46db3751d8e999, xxHash64("abc") = 44bc2cf5ad770999
         My::Hasher h2(My::Hasher::Algorithm::XxHash64);
         h2.update("");
-        EXPECT_EQ(h2.finalize(), "2be48486f6c12fe5");
+        EXPECT_EQ(h2.finalize(), "ef46db3751d8e999");
 
         My::Hasher h3(My::Hasher::Algorithm::XxHash64);
         h3.update("abc");
-        EXPECT_EQ(h3.finalize(), "7cb59da24f152cc3");
+        EXPECT_EQ(h3.finalize(), "44bc2cf5ad770999");
     }
 
     // Hasher：finalize 后开始新计算（不是拼接追加）

@@ -1,49 +1,339 @@
+# =============================================================================
+# MyFile CI — 企业级持续集成配置
+#
+# 覆盖维度:
+#   1. 多平台 × 多编译器 × 多构建类型 (构建+测试矩阵)
+#   2. 内存安全检测 (ASan + UBSan)
+#   3. 线程安全检测 (TSan)
+#   4. 代码覆盖率 (lcov → Codecov)
+#   5. 静态分析 (clang-tidy)
+#   6. 依赖缓存加速
+# =============================================================================
+
 name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
   workflow_dispatch:
 
+# 同一 PR 多次推送时，自动取消旧的运行
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_VERSION: "3.27"
+
 jobs:
-  test:
-    name: ${{ matrix.os }}
+  # ===========================================================================
+  # 1. 构建 + 测试矩阵
+  #    3 平台 × 多编译器 × Debug/Release
+  # ===========================================================================
+  build-test:
+    name: "${{ matrix.os }} · ${{ matrix.compiler }} · ${{ matrix.build_type }}"
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        include:
+          # ---- Linux (GCC) ----
+          - os: ubuntu-latest
+            compiler: gcc
+            cc: gcc-13
+            cxx: g++-13
+            build_type: Release
+
+          - os: ubuntu-latest
+            compiler: gcc
+            cc: gcc-13
+            cxx: g++-13
+            build_type: Debug
+
+          # ---- Linux (Clang) ----
+          - os: ubuntu-latest
+            compiler: clang
+            cc: clang-18
+            cxx: clang++-18
+            build_type: Release
+
+          - os: ubuntu-latest
+            compiler: clang
+            cc: clang-18
+            cxx: clang++-18
+            build_type: Debug
+
+          # ---- macOS (Apple Clang) ----
+          - os: macos-latest
+            compiler: apple-clang
+            cc: clang
+            cxx: clang++
+            build_type: Release
+
+          - os: macos-latest
+            compiler: apple-clang
+            cc: clang
+            cxx: clang++
+            build_type: Debug
+
+          # ---- Windows (MSVC) ----
+          - os: windows-latest
+            compiler: msvc
+            cc: cl
+            cxx: cl
+            build_type: Release
+
+          - os: windows-latest
+            compiler: msvc
+            cc: cl
+            cxx: cl
+            build_type: Debug
+
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build
-        run: cmake --build build --config Release --parallel
-
-      - name: Test
-        run: ctest --test-dir build -C Release --output-on-failure
-
-  sanitizer:
-    name: Linux ASan+UBSan
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure (ASan+UBSan)
+      # ---- 安装 Linux 编译器 ----
+      - name: Install GCC 13 (Ubuntu)
+        if: matrix.os == 'ubuntu-latest' && matrix.compiler == 'gcc'
         run: |
-          cmake -S . -B build \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
-            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          sudo apt-get update -q
+          sudo apt-get install -y gcc-13 g++-13
+
+      - name: Install Clang 18 (Ubuntu)
+        if: matrix.os == 'ubuntu-latest' && matrix.compiler == 'clang'
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          sudo apt-add-repository "deb http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-18 main"
+          sudo apt-get update -q
+          sudo apt-get install -y clang-18
+
+      # ---- CMake 缓存 ----
+      - name: CMake Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/ccache
+            ~/AppData/Local/ccache
+          key: ${{ matrix.os }}-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ hashFiles('**/CMakeLists.txt') }}
+          restore-keys: |
+            ${{ matrix.os }}-${{ matrix.compiler }}-${{ matrix.build_type }}-
+
+      # ---- Configure ----
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DBUILD_TESTS=ON
+          ${{ matrix.os != 'windows-latest' && '-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache' || '' }}
+
+      # ---- Build ----
+      - name: Build
+        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+
+      # ---- Test ----
+      - name: Test
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120
+
+      # ---- 测试日志归档（失败时自动上传） ----
+      - name: Upload Test Log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-${{ matrix.os }}-${{ matrix.compiler }}-${{ matrix.build_type }}
+          path: build/Testing/
+          retention-days: 7
+
+  # ===========================================================================
+  # 2. 内存安全: AddressSanitizer + UndefinedBehaviorSanitizer
+  # ===========================================================================
+  sanitizer-asan-ubsan:
+    name: "Linux · ASan + UBSan"
+    needs: build-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GCC 13
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y gcc-13 g++-13
+
+      - name: Configure (ASan + UBSan)
+        env:
+          CC: gcc-13
+          CXX: g++-13
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-common"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
 
       - name: Build
         run: cmake --build build --parallel
 
       - name: Test
         env:
-          ASAN_OPTIONS: detect_leaks=0
-          UBSAN_OPTIONS: print_stacktrace=1
-        run: ctest --test-dir build --output-on-failure
+          ASAN_OPTIONS: "detect_leaks=1:abort_on_error=1:halt_on_error=1"
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+          LSAN_OPTIONS: "suppressions=.lsan_suppressions"
+        run: ctest --test-dir build --output-on-failure --timeout 180
+
+  # ===========================================================================
+  # 3. 线程安全: ThreadSanitizer
+  # ===========================================================================
+  sanitizer-tsan:
+    name: "Linux · TSan"
+    needs: build-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GCC 13
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y gcc-13 g++-13
+
+      - name: Configure (TSan)
+        env:
+          CC: gcc-13
+          CXX: g++-13
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        env:
+          TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
+        run: ctest --test-dir build --output-on-failure --timeout 300
+
+  # ===========================================================================
+  # 4. 代码覆盖率 (GCC + gcov + lcov → Codecov)
+  # ===========================================================================
+  coverage:
+    name: "Linux · Coverage"
+    needs: build-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GCC 13 + lcov
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y gcc-13 g++-13 lcov
+
+      - name: Configure (Coverage)
+        env:
+          CC: gcc-13
+          CXX: g++-13
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_FLAGS="--coverage -O0 -fno-inline"
+          -DCMAKE_EXE_LINKER_FLAGS="--coverage"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
+      - name: Generate Coverage Report
+        run: |
+          lcov --capture --directory build --output-file coverage.info \
+            --gcov-tool gcov-13 \
+            --ignore-errors mismatch,source
+          # 只保留库源码，排除测试/第三方
+          lcov --remove coverage.info \
+            '*/tests/*' '*/third/*' '*/build/*' '*/usr/*' \
+            --output-file coverage_filtered.info \
+            --ignore-errors unused
+          lcov --list coverage_filtered.info
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage_filtered.info
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  # ===========================================================================
+  # 5. 静态分析 (clang-tidy)
+  # ===========================================================================
+  clang-tidy:
+    name: "Linux · clang-tidy"
+    needs: build-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Clang 18
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          sudo apt-add-repository "deb http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-18 main"
+          sudo apt-get update -q
+          sudo apt-get install -y clang-18 clang-tidy-18
+
+      - name: Configure (clang-tidy)
+        env:
+          CC: clang-18
+          CXX: clang++-18
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_CLANG_TIDY="clang-tidy-18;--warnings-as-errors=bugprone-*,performance-*,portability-*"
+
+      - name: Build (runs clang-tidy)
+        run: cmake --build build --parallel 2>&1 | tee clang-tidy-output.txt
+
+      - name: Upload clang-tidy log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clang-tidy-log
+          path: clang-tidy-output.txt
+          retention-days: 7
+
+  # ===========================================================================
+  # 6. 汇总状态（用于分支保护规则）
+  #     只需在 GitHub 设置 → Branch protection → Required status checks
+  #     中添加 "ci-pass" 即可，所有 job 通过才算 CI 通过
+  # ===========================================================================
+  ci-pass:
+    name: "CI — All checks passed"
+    if: always()
+    needs:
+      - build-test
+      - sanitizer-asan-ubsan
+      - sanitizer-tsan
+      - coverage
+      - clang-tidy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all jobs
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]] || \
+             [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "::error::One or more CI jobs failed or were cancelled."
+            exit 1
+          fi
+          echo "✅ All CI checks passed."

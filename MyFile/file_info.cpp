@@ -39,7 +39,7 @@ My::File::lastModified(std::string_view filename)
     auto ftime = std::filesystem::last_write_time(ToPath(filename), ec);
     if (ec)
         return std::nullopt;
-    return std::chrono::clock_cast<std::chrono::system_clock>(ftime);
+    return FileClockToSystem(ftime);
 }
 
 std::optional<size_t> My::File::lineCount(std::string_view filename)

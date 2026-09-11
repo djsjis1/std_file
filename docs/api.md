@@ -308,7 +308,7 @@ My::File::insert("f.txt")
 
 ## Hasher 增量哈希
 
-流式计算哈希：多次 `update()` 后调用 `finalize()` 获取十六进制结果。支持 SHA-256、CRC32、xxHash64 三种算法。`finalize()` 后内部状态重置，可继续计算。
+流式计算哈希：多次 `update()` 后调用 `finalize()` 获取十六进制结果。支持 SHA-256、CRC32、xxHash64 三种算法。`finalize()` 后内部状态**重置为初始值**，后续 `update()` 开始一轮**全新的哈希计算**（不是在上次结果上拼接追加）。
 
 ```cpp
 class Hasher {
@@ -325,7 +325,7 @@ class Hasher {
 | `Hasher(algo)` | 构造指定算法的哈希计算器 |
 | `update(data, len)` | 喂入数据，可多次调用 |
 | `update(string_view)` | 便捷重载 |
-| `finalize()` | 计算并返回十六进制结果，内部状态重置后可继续使用 |
+| `finalize()` | 计算并返回十六进制结果。调用后内部状态重置为初始值，可开始新一轮独立哈希（非拼接追加） |
 
 ```cpp
 // 增量计算 SHA-256
@@ -341,7 +341,7 @@ std::string hex = h.finalize(); // 与 fileHash 结果一致
 
 ## LineIndex 行索引缓存
 
-一次遍历记录行起始字节偏移，后续 `readLine` 经 O(1) 直接寻址定位。支持稀疏模式：`granularity > 1` 时每 N 行存一个锚点，内存降低 N 倍。构造时记录 `size + mtime + 首尾 64 字节内容摘要`，`validate()` 可检测文件外部变更。
+一次遍历记录行起始字节偏移，后续 `readLine` 经 O(1) 直接寻址定位。支持稀疏模式：`granularity > 1` 时每 N 行存一个锚点，内存降低 N 倍。构造时记录 `size + mtime + 首尾 64 字节内容摘要`，`validate()` 可检测文件外部变更。`validate()` 内部有 1 秒短时缓存，高频 `readLine` 场景不会每次都触发系统调用。
 
 ```cpp
 class LineIndex {
@@ -359,11 +359,11 @@ class LineIndex {
 | `LineIndex(filename, granularity)` | 构造时遍历文件，记录行偏移。`granularity=1`（默认）稠密模式，每行一个锚点；`granularity=N` 稀疏模式，每 N 行一个锚点，内存降低 N 倍 |
 | `lineCount()` | 返回总行数 |
 | `lineStart(n)` | 返回第 `n` 行（从 1 起）的字节偏移。稀疏模式下返回最近锚点偏移，`readLine` 自动锚内短扫描 |
-| `validate(filename)` | 检查文件 `size + mtime + 首尾 64 字节内容摘要` 是否与构造时一致 |
+| `validate(filename)` | 检查文件 `size + mtime + 首尾 64 字节内容摘要` 是否与构造时一致。内部有 1 秒短时缓存，1 秒内重复调用直接返回上次结果，避免每次 `readLine` 触发 5 个系统调用 |
 | `valid()` | 构造是否成功（文件能打开且读取无错） |
 | `granularity()` | 返回当前稀疏粒度 |
 
-> **失效检测增强**：除 `size + mtime` 外，还校验文件首尾各 64 字节的 FNV-1a 摘要，同尺寸同 mtime 但内容已变的场景也能检出。
+> **失效检测增强**：除 `size + mtime` 外，还校验文件首尾各 64 字节的 FNV-1a 摘要，同尺寸同 mtime 但内容已变的场景也能检出。`validate()` 结果缓存 1 秒——对高频 `readLine`（每次调用都 validate）而言，随机读行不再每次付出 open + stat + read 的系统调用开销。文件变更后最多 1 秒即可检出。
 
 ---
 

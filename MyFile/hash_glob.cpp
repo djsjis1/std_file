@@ -245,7 +245,7 @@ namespace
     }
 
     constexpr uint64_t kXXH_P1 = 0x9E3779B185EBCA87ULL;
-    constexpr uint64_t kXXH_P2 = 0x14DEF9DEA2F79CD6ULL;
+    constexpr uint64_t kXXH_P2 = 0xC2B2AE3D27D4EB4FULL;
     constexpr uint64_t kXXH_P3 = 0x165667B19E3779F9ULL;
     constexpr uint64_t kXXH_P4 = 0x85EBCA77C2B2AE63ULL;
     constexpr uint64_t kXXH_P5 = 0x27D4EB2F165667C5ULL;

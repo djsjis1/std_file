@@ -124,6 +124,28 @@ namespace My::detail
 #endif
     }
 
+    std::chrono::system_clock::time_point FileClockToSystem(std::filesystem::file_time_type ft)
+    {
+#if defined(__cpp_lib_chrono) && __cpp_lib_chrono >= 201907L
+        // C++20 clock_cast 可用
+        return std::chrono::clock_cast<std::chrono::system_clock>(ft);
+#else
+        // 兼容方案：用两个 clock 的 now() tick 差值做 epoch 偏移
+        // 精度取决于 duration 分辨率，对文件 mtime 比较完全够用
+        using namespace std::chrono;
+        const auto fileNow = std::filesystem::file_time_type::clock::now();
+        const auto sysNow = system_clock::now();
+        // 用各自 duration 的 tick 数计算 epoch 偏移（避免跨 clock 减法）
+        const auto offsetTicks = sysNow.time_since_epoch().count()
+                               - fileNow.time_since_epoch().count();
+        // 将 ft 转为 system_clock 的 duration 分辨率
+        const auto ftTicks = duration_cast<system_clock::duration>(
+            ft.time_since_epoch()).count();
+        return system_clock::time_point(
+            system_clock::duration(ftTicks + offsetTicks));
+#endif
+    }
+
     // ==================== 错误报告 ====================
     void DefaultErrorHandler(std::string_view func, std::string_view filename, std::string_view message)
     {

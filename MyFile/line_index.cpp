@@ -63,8 +63,7 @@ My::LineIndex::LineIndex(std::string_view filename, size_t granularity)
         return;
     fileSize_ = FdSize(fd.get()).value_or(0);
     std::error_code ec;
-    mtime_ = std::chrono::clock_cast<std::chrono::system_clock>(
-        std::filesystem::last_write_time(path, ec));
+    mtime_ = FileClockToSystem(std::filesystem::last_write_time(path, ec));
 
     // 计算首尾内容摘要
     ComputeHeadTailHash(fd.get(), fileSize_, headHash_, tailHash_);
@@ -158,34 +157,62 @@ bool My::LineIndex::validate(std::string_view filename) const
 {
     if (!valid_)
         return false;
+
+    // 短时缓存：1 秒内重复调用直接返回上次结果，避免每次 readLine 触发系统调用
+    const auto now = std::chrono::steady_clock::now();
+    if (cachedValid_ && std::chrono::duration_cast<std::chrono::seconds>(now - cachedTime_).count() < 1)
+        return true;
+
     std::error_code ec;
     const auto path = ToPath(filename);
 
     // 1. 检查文件大小
     const auto sz = std::filesystem::file_size(path, ec);
     if (ec || sz != fileSize_)
+    {
+        cachedValid_ = false;
+        cachedTime_ = now;
         return false;
+    }
 
     // 2. 检查 mtime
     auto ft = std::filesystem::last_write_time(path, ec);
     if (ec)
+    {
+        cachedValid_ = false;
+        cachedTime_ = now;
         return false;
-    const auto currentMtime = std::chrono::clock_cast<std::chrono::system_clock>(ft);
+    }
+    const auto currentMtime = FileClockToSystem(ft);
     if (currentMtime != mtime_)
+    {
+        cachedValid_ = false;
+        cachedTime_ = now;
         return false;
+    }
 
     // 3. 内容摘要兜底（mtime 同秒修改也能检出）
     if (fileSize_ > 0)
     {
         Fd fd(OpenRead(path));
         if (!fd)
+        {
+            cachedValid_ = false;
+            cachedTime_ = now;
             return false;
+        }
         uint64_t headHash = 0, tailHash = 0;
         ComputeHeadTailHash(fd.get(), fileSize_, headHash, tailHash);
         if (headHash != headHash_ || tailHash != tailHash_)
+        {
+            cachedValid_ = false;
+            cachedTime_ = now;
             return false;
+        }
     }
 
+    cachedValid_ = true;
+    cachedTime_ = now;
     return true;
 }
 

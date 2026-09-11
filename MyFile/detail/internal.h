@@ -147,6 +147,9 @@ namespace My::detail
     // 检查路径是否为目录（用于 readall/readBytes 统一跨平台报错）
     bool IsDirectory(const std::filesystem::path &p);
 
+    // 将 file_time_type 转换为 system_clock::time_point（兼容不支持 clock_cast 的编译器）
+    std::chrono::system_clock::time_point FileClockToSystem(std::filesystem::file_time_type ft);
+
     // ==================== 错误报告 ====================
     extern My::ErrorHandler g_errorHandler;
 
