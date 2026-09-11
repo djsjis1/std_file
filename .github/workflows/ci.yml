@@ -127,38 +127,7 @@ jobs:
 
       # ---- Test ----
       - name: Test
-        shell: bash
-        run: |
-          # 找到测试二进制并直接运行
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            TEST_BIN=$(find build -name "file_tests.exe" | head -1)
-          else
-            TEST_BIN=$(find build -name "file_tests" -type f | head -1)
-          fi
-          echo "Test binary: $TEST_BIN"
-          if [ -z "$TEST_BIN" ]; then
-            echo "ERROR: test binary not found!"
-            find build -type f -name "file_tests*"
-            exit 1
-          fi
-          # 运行测试，保存输出
-          "$TEST_BIN" > test-output.txt 2>&1
-          EXIT_CODE=$?
-          # 将失败的测试输出作为 annotation（可通过 API 查看）
-          if [ $EXIT_CODE -ne 0 ]; then
-            # 提取 FAILED 行
-            while IFS= read -r line; do
-              echo "::error::$line"
-            done < <(grep -E "\[  FAILED  \]|FAILED TEST|Failure|error:|Expected|Actual" test-output.txt || true)
-            # 输出摘要
-            echo "::error::Test exit code: $EXIT_CODE"
-            grep -E "\[  PASSED  \]|\[  FAILED  \]" test-output.txt | while IFS= read -r line; do
-              echo "::error::$line"
-            done
-          fi
-          # 也输出到最后 30 行
-          tail -30 test-output.txt
-          exit $EXIT_CODE
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
 
       # ---- 测试日志归档（失败时自动上传） ----
       - name: Upload Test Log (on failure)
@@ -166,7 +135,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-log-${{ matrix.os }}-${{ matrix.compiler }}-${{ matrix.build_type }}
-          path: test-output.txt
+          path: build/Testing/
           retention-days: 7
 
   # ===========================================================================

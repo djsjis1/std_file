@@ -126,20 +126,19 @@ namespace My::detail
 
     std::chrono::system_clock::time_point FileClockToSystem(std::filesystem::file_time_type ft)
     {
-        // 跨编译器兼容方案：用两个 clock 的 now() tick 差值做 epoch 偏移
+        // 跨编译器兼容方案：将两个 clock 的 now() 统一到同一 duration 后计算 epoch 偏移
         // 不依赖 C++20 clock_cast（GCC 13 / Clang 18 的 libstdc++ 尚未实现）
-        // 精度取决于 duration 分辨率，对文件 mtime 比较完全够用
+        // 注意：不能直接减不同 clock 的 time_point，必须先 duration_cast 到同一分辨率
         using namespace std::chrono;
+        using common_t = system_clock::duration;
         const auto fileNow = std::filesystem::file_time_type::clock::now();
         const auto sysNow = system_clock::now();
-        // 用各自 duration 的 tick 数计算 epoch 偏移（避免跨 clock 减法）
-        const auto offsetTicks = sysNow.time_since_epoch().count()
-                               - fileNow.time_since_epoch().count();
-        // 将 ft 转为 system_clock 的 duration 分辨率
-        const auto ftTicks = duration_cast<system_clock::duration>(
-            ft.time_since_epoch()).count();
-        return system_clock::time_point(
-            system_clock::duration(ftTicks + offsetTicks));
+        // 统一到 system_clock 分辨率后做减法（避免跨 clock 类型错误 + tick 周期不匹配）
+        const auto offsetTicks = (time_point_cast<common_t>(sysNow).time_since_epoch()
+                                - time_point_cast<common_t>(fileNow).time_since_epoch()).count();
+        // 将 ft 转为 system_clock 分辨率
+        const auto ftTicks = duration_cast<common_t>(ft.time_since_epoch()).count();
+        return system_clock::time_point(system_clock::duration(ftTicks + offsetTicks));
     }
 
     // ==================== 错误报告 ====================
