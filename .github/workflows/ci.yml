@@ -127,7 +127,8 @@ jobs:
 
       # ---- Test ----
       - name: Test
-        run: ctest --test-dir build -C ${{ matrix.build_type }} --verbose
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --verbose 2>&1 | tee test-output.txt; exit ${PIPESTATUS[0]}
+        shell: bash
 
       # ---- 测试日志归档（失败时自动上传） ----
       - name: Upload Test Log (on failure)
@@ -135,7 +136,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-log-${{ matrix.os }}-${{ matrix.compiler }}-${{ matrix.build_type }}
-          path: build/Testing/
+          path: test-output.txt
           retention-days: 7
 
   # ===========================================================================
