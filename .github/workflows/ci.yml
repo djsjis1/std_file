@@ -127,7 +127,24 @@ jobs:
 
       # ---- Test ----
       - name: Test
-        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
+        shell: bash
+        run: |
+          # 找到测试二进制
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            TEST_BIN=$(find build -name "file_tests.exe" -type f | head -1)
+          else
+            TEST_BIN=$(find build -name "file_tests" -type f | head -1)
+          fi
+          echo "Test binary: $TEST_BIN"
+          if [ -z "$TEST_BIN" ]; then
+            echo "ERROR: test binary not found!"
+            exit 1
+          fi
+          # 运行测试，输出到 step summary（公开可见）
+          echo "## Test Output: ${{ matrix.os }} ${{ matrix.compiler }} ${{ matrix.build_type }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          "$TEST_BIN" 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          exit ${PIPESTATUS[0]}
 
       # ---- 测试日志归档（失败时自动上传） ----
       - name: Upload Test Log (on failure)
