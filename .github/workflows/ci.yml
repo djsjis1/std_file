@@ -127,8 +127,22 @@ jobs:
 
       # ---- Test ----
       - name: Test
-        run: ctest --test-dir build -C ${{ matrix.build_type }} --verbose 2>&1 | tee test-output.txt; exit ${PIPESTATUS[0]}
         shell: bash
+        run: |
+          # 找到测试二进制并直接运行
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            TEST_BIN=$(find build -name "file_tests.exe" | head -1)
+          else
+            TEST_BIN=$(find build -name "file_tests" -type f | head -1)
+          fi
+          echo "Test binary: $TEST_BIN"
+          if [ -z "$TEST_BIN" ]; then
+            echo "ERROR: test binary not found!"
+            find build -type f -name "file_tests*"
+            exit 1
+          fi
+          "$TEST_BIN" 2>&1 | tee test-output.txt
+          exit ${PIPESTATUS[0]}
 
       # ---- 测试日志归档（失败时自动上传） ----
       - name: Upload Test Log (on failure)
