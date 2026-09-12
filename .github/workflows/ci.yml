@@ -127,38 +127,7 @@ jobs:
 
       # ---- Test ----
       - name: Test
-        shell: bash
-        run: |
-          # 找到测试二进制
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            TEST_BIN=$(find build -name "file_tests.exe" -type f | head -1)
-          else
-            TEST_BIN=$(find build -name "file_tests" -type f | head -1)
-          fi
-          echo "Test binary: $TEST_BIN"
-          if [ -z "$TEST_BIN" ]; then
-            echo "ERROR: test binary not found!"
-            exit 1
-          fi
-          # 运行测试
-          "$TEST_BIN" > test-output.txt 2>&1
-          EXIT_CODE=$?
-          # 用 ::error:: 输出关键信息（不在管道中，确保 GitHub 能处理）
-          echo "::error::Test exit code: $EXIT_CODE"
-          # PASSED/FAILED 摘要
-          SUMMARY=$(grep -E "\[  PASSED  \]|\[  FAILED  \]" test-output.txt || true)
-          if [ -n "$SUMMARY" ]; then
-            while IFS= read -r line; do echo "::error::$line"; done <<< "$SUMMARY"
-          fi
-          # 失败详情
-          FAIL_DETAILS=$(grep -A3 "Failure\|Expected\|Actual" test-output.txt || true)
-          if [ -n "$FAIL_DETAILS" ]; then
-            while IFS= read -r line; do echo "::error::$line"; done <<< "$FAIL_DETAILS"
-          fi
-          # 最后 5 行
-          LAST_LINES=$(tail -5 test-output.txt)
-          while IFS= read -r line; do echo "::error::$line"; done <<< "$LAST_LINES"
-          exit $EXIT_CODE
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
 
       # ---- 测试日志归档（失败时自动上传） ----
       - name: Upload Test Log (on failure)
