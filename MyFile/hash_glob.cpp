@@ -32,54 +32,81 @@ namespace
         return pi == pattern.size();
     }
 
-    constexpr uint32_t kSha256K[64] = {
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
-    constexpr uint32_t Rr(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+    // ==================== xxHash64 辅助 ====================
+    constexpr uint64_t kXXH_P1 = 0x9E3779B185EBCA87ULL;
+    constexpr uint64_t kXXH_P2 = 0xC2B2AE3D27D4EB4FULL;
+    constexpr uint64_t kXXH_P3 = 0x165667B19E3779F9ULL;
+    constexpr uint64_t kXXH_P4 = 0x85EBCA77C2B2AE63ULL;
+    constexpr uint64_t kXXH_P5 = 0x27D4EB2F165667C5ULL;
 
-    void Sha256Transform(uint32_t state[8], const uint8_t block[64])
+    uint64_t XXHR(uint64_t a, uint64_t i)
     {
-        uint32_t w[64];
-        for (int i = 0; i < 16; ++i)
-            w[i] = (uint32_t(block[i * 4]) << 24) | (uint32_t(block[i * 4 + 1]) << 16) |
-                   (uint32_t(block[i * 4 + 2]) << 8) | uint32_t(block[i * 4 + 3]);
-        for (int i = 16; i < 64; ++i)
+        a += i * kXXH_P2;
+        a = (a << 31) | (a >> 33);
+        a *= kXXH_P1;
+        return a;
+    }
+    uint64_t XXHA(uint64_t h)
+    {
+        h ^= h >> 33;
+        h *= kXXH_P2;
+        h ^= h >> 29;
+        h *= kXXH_P3;
+        h ^= h >> 32;
+        return h;
+    }
+    uint64_t RLE64(const void *p)
+    {
+        const auto *b = static_cast<const uint8_t *>(p);
+        return uint64_t(b[0]) | (uint64_t(b[1]) << 8) | (uint64_t(b[2]) << 16) | (uint64_t(b[3]) << 24) | (uint64_t(b[4]) << 32) | (uint64_t(b[5]) << 40) | (uint64_t(b[6]) << 48) | (uint64_t(b[7]) << 56);
+    }
+    uint32_t RLE32(const void *p)
+    {
+        const auto *b = static_cast<const uint8_t *>(p);
+        return uint32_t(b[0]) | (uint32_t(b[1]) << 8) | (uint32_t(b[2]) << 16) | (uint32_t(b[3]) << 24);
+    }
+
+    // ==================== CRC32 查表 ====================
+    const uint32_t *Crc32Table()
+    {
+        static uint32_t table[256] = {};
+        static bool init = false;
+        if (!init)
         {
-            uint32_t s0 = Rr(w[i - 15], 7) ^ Rr(w[i - 15], 18) ^ (w[i - 15] >> 3);
-            uint32_t s1 = Rr(w[i - 2], 17) ^ Rr(w[i - 2], 19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+            for (uint32_t i = 0; i < 256; ++i)
+            {
+                uint32_t c = i;
+                for (int j = 0; j < 8; ++j)
+                    c = (c & 1) ? (0xEDB88320 ^ (c >> 1)) : (c >> 1);
+                table[i] = c;
+            }
+            init = true;
         }
-        uint32_t a = state[0], b = state[1], c = state[2], d = state[3],
-                 e = state[4], f = state[5], g = state[6], h = state[7];
-        for (int i = 0; i < 64; ++i)
+        return table;
+    }
+
+    // ==================== 十六进制格式化 ====================
+    std::string Hex64(uint64_t v)
+    {
+        static constexpr char h[] = "0123456789abcdef";
+        std::string r(16, '0');
+        for (int i = 15; i >= 0; --i)
         {
-            uint32_t S1 = Rr(e, 6) ^ Rr(e, 11) ^ Rr(e, 25), ch = (e & f) ^ (~e & g);
-            uint32_t t1 = h + S1 + ch + kSha256K[i] + w[i];
-            uint32_t S0 = Rr(a, 2) ^ Rr(a, 13) ^ Rr(a, 22), mj = (a & b) ^ (a & c) ^ (b & c);
-            uint32_t t2 = S0 + mj;
-            h = g;
-            g = f;
-            f = e;
-            e = d + t1;
-            d = c;
-            c = b;
-            b = a;
-            a = t1 + t2;
+            r[i] = h[v & 0xF];
+            v >>= 4;
         }
-        state[0] += a;
-        state[1] += b;
-        state[2] += c;
-        state[3] += d;
-        state[4] += e;
-        state[5] += f;
-        state[6] += g;
-        state[7] += h;
+        return r;
+    }
+    std::string Hex32(uint32_t v)
+    {
+        static constexpr char h[] = "0123456789abcdef";
+        std::string r(8, '0');
+        for (int i = 7; i >= 0; --i)
+        {
+            r[i] = h[v & 0xF];
+            v >>= 4;
+        }
+        return r;
     }
 } // namespace
 
@@ -130,227 +157,6 @@ std::vector<std::string> My::File::globFiles(std::string_view path, std::string_
     return result;
 }
 
-// ==================== SHA-256 哈希 ====================
-
-std::optional<std::string> My::File::fileHash(std::string_view filename)
-{
-    Fd fd(OpenRead(ToPath(filename)));
-    if (!fd)
-        return std::nullopt;
-
-    uint32_t state[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-                         0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
-    const auto buffer = std::make_unique<char[]>(kIoBlockSize);
-    uint8_t pending[64]{};
-    size_t pendingLen = 0;
-    uint64_t totalBytes = 0;
-
-    for (;;)
-    {
-        const auto r = ReadFd(fd.get(), buffer.get(), kIoBlockSize);
-        if (r < 0)
-            return std::nullopt;
-        if (r == 0)
-            break;
-        totalBytes += static_cast<size_t>(r);
-
-        const uint8_t *data = reinterpret_cast<const uint8_t *>(buffer.get());
-        size_t remaining = static_cast<size_t>(r);
-
-        if (pendingLen > 0)
-        {
-            size_t need = 64 - pendingLen;
-            size_t take = (std::min)(need, remaining);
-            std::memcpy(pending + pendingLen, data, take);
-            pendingLen += take;
-            data += take;
-            remaining -= take;
-            if (pendingLen == 64)
-            {
-                Sha256Transform(state, pending);
-                pendingLen = 0;
-            }
-        }
-        while (remaining >= 64)
-        {
-            Sha256Transform(state, data);
-            data += 64;
-            remaining -= 64;
-        }
-        if (remaining > 0)
-        {
-            std::memcpy(pending, data, remaining);
-            pendingLen = remaining;
-        }
-    }
-
-    pending[pendingLen++] = 0x80;
-    if (pendingLen > 56)
-    {
-        std::memset(pending + pendingLen, 0, 64 - pendingLen);
-        Sha256Transform(state, pending);
-        pendingLen = 0;
-    }
-    std::memset(pending + pendingLen, 0, 56 - pendingLen);
-    uint64_t bits = totalBytes * 8;
-    for (int i = 0; i < 8; ++i)
-        pending[56 + i] = static_cast<uint8_t>(bits >> (56 - i * 8));
-    Sha256Transform(state, pending);
-
-    static constexpr char hex[] = "0123456789abcdef";
-    std::string result(64, '0');
-    for (int i = 0; i < 8; ++i)
-    {
-        result[i * 8 + 0] = hex[(state[i] >> 28) & 0xf];
-        result[i * 8 + 1] = hex[(state[i] >> 24) & 0xf];
-        result[i * 8 + 2] = hex[(state[i] >> 20) & 0xf];
-        result[i * 8 + 3] = hex[(state[i] >> 16) & 0xf];
-        result[i * 8 + 4] = hex[(state[i] >> 12) & 0xf];
-        result[i * 8 + 5] = hex[(state[i] >> 8) & 0xf];
-        result[i * 8 + 6] = hex[(state[i] >> 4) & 0xf];
-        result[i * 8 + 7] = hex[state[i] & 0xf];
-    }
-    return result;
-}
-
-// ==================== CRC32 ====================
-
-namespace
-{
-    const uint32_t *Crc32Table()
-    {
-        static uint32_t table[256] = {};
-        static bool init = false;
-        if (!init)
-        {
-            for (uint32_t i = 0; i < 256; ++i)
-            {
-                uint32_t c = i;
-                for (int j = 0; j < 8; ++j)
-                    c = (c & 1) ? (0xEDB88320 ^ (c >> 1)) : (c >> 1);
-                table[i] = c;
-            }
-            init = true;
-        }
-        return table;
-    }
-
-    uint32_t Crc32Update(uint32_t crc, const char *data, size_t len)
-    {
-        const uint32_t *table = Crc32Table();
-        crc = ~crc;
-        for (size_t i = 0; i < len; ++i)
-            crc = table[(crc ^ static_cast<uint8_t>(data[i])) & 0xFF] ^ (crc >> 8);
-        return ~crc;
-    }
-
-    constexpr uint64_t kXXH_P1 = 0x9E3779B185EBCA87ULL;
-    constexpr uint64_t kXXH_P2 = 0xC2B2AE3D27D4EB4FULL;
-    constexpr uint64_t kXXH_P3 = 0x165667B19E3779F9ULL;
-    constexpr uint64_t kXXH_P4 = 0x85EBCA77C2B2AE63ULL;
-    constexpr uint64_t kXXH_P5 = 0x27D4EB2F165667C5ULL;
-
-    uint64_t XXHR(uint64_t a, uint64_t i)
-    {
-        a += i * kXXH_P2;
-        a = (a << 31) | (a >> 33);
-        a *= kXXH_P1;
-        return a;
-    }
-    uint64_t XXHA(uint64_t h)
-    {
-        h ^= h >> 33;
-        h *= kXXH_P2;
-        h ^= h >> 29;
-        h *= kXXH_P3;
-        h ^= h >> 32;
-        return h;
-    }
-    uint64_t RLE64(const void *p)
-    {
-        const auto *b = static_cast<const uint8_t *>(p);
-        return uint64_t(b[0]) | (uint64_t(b[1]) << 8) | (uint64_t(b[2]) << 16) | (uint64_t(b[3]) << 24) | (uint64_t(b[4]) << 32) | (uint64_t(b[5]) << 40) | (uint64_t(b[6]) << 48) | (uint64_t(b[7]) << 56);
-    }
-    uint32_t RLE32(const void *p)
-    {
-        const auto *b = static_cast<const uint8_t *>(p);
-        return uint32_t(b[0]) | (uint32_t(b[1]) << 8) | (uint32_t(b[2]) << 16) | (uint32_t(b[3]) << 24);
-    }
-
-    uint64_t XXH64(const char *data, size_t len)
-    {
-        const uint8_t *p = reinterpret_cast<const uint8_t *>(data);
-        const uint8_t *const end = p + len;
-        uint64_t h;
-        if (len >= 32)
-        {
-            const uint8_t *const limit = end - 32;
-            uint64_t v1 = kXXH_P1 + kXXH_P2, v2 = kXXH_P2, v3 = 0, v4 = 0 - kXXH_P1;
-            do
-            {
-                v1 = XXHR(v1, RLE64(p));
-                p += 8;
-                v2 = XXHR(v2, RLE64(p));
-                p += 8;
-                v3 = XXHR(v3, RLE64(p));
-                p += 8;
-                v4 = XXHR(v4, RLE64(p));
-                p += 8;
-            } while (p <= limit);
-            h = ((v1 << 1) | (v1 >> 63)) + ((v2 << 7) | (v2 >> 57)) + ((v3 << 12) | (v3 >> 52)) + ((v4 << 18) | (v4 >> 46));
-            h = (h ^ (((v1 << 31) | (v1 >> 33)) * kXXH_P1)) * kXXH_P1 + kXXH_P4;
-            h = (h ^ (((v2 << 31) | (v2 >> 33)) * kXXH_P1)) * kXXH_P1 + kXXH_P4;
-            h = (h ^ (((v3 << 31) | (v3 >> 33)) * kXXH_P1)) * kXXH_P1 + kXXH_P4;
-            h = (h ^ (((v4 << 31) | (v4 >> 33)) * kXXH_P1)) * kXXH_P1 + kXXH_P4;
-        }
-        else
-            h = kXXH_P5;
-        h += len;
-        while (p + 8 <= end)
-        {
-            h ^= XXHR(0, RLE64(p));
-            h = ((h << 27) | (h >> 37)) * kXXH_P1 + kXXH_P4;
-            p += 8;
-        }
-        while (p + 4 <= end)
-        {
-            h ^= uint64_t(RLE32(p)) * kXXH_P1;
-            h = ((h << 23) | (h >> 41)) * kXXH_P2 + kXXH_P3;
-            p += 4;
-        }
-        while (p < end)
-        {
-            h ^= uint64_t(*p) * kXXH_P5;
-            h = ((h << 11) | (h >> 53)) * kXXH_P1;
-            ++p;
-        }
-        return XXHA(h);
-    }
-
-    std::string Hex64(uint64_t v)
-    {
-        static constexpr char h[] = "0123456789abcdef";
-        std::string r(16, '0');
-        for (int i = 15; i >= 0; --i)
-        {
-            r[i] = h[v & 0xF];
-            v >>= 4;
-        }
-        return r;
-    }
-    std::string Hex32(uint32_t v)
-    {
-        static constexpr char h[] = "0123456789abcdef";
-        std::string r(8, '0');
-        for (int i = 7; i >= 0; --i)
-        {
-            r[i] = h[v & 0xF];
-            v >>= 4;
-        }
-        return r;
-    }
-} // namespace
-
 // ==================== filesEqual ====================
 
 bool My::File::filesEqual(std::string_view file1, std::string_view file2)
@@ -385,14 +191,14 @@ bool My::File::filesEqual(std::string_view file1, std::string_view file2)
     return true;
 }
 
-// ==================== fileCrc32 ====================
+// ==================== 文件哈希（统一走 Hasher） ====================
 
-std::optional<std::string> My::File::fileCrc32(std::string_view filename)
+std::optional<std::string> My::File::fileHash(std::string_view filename)
 {
     Fd fd(OpenRead(ToPath(filename)));
     if (!fd)
         return std::nullopt;
-    uint32_t crc = 0;
+    My::Hasher hasher(My::Hasher::Algorithm::Sha256);
     const auto buffer = std::make_unique<char[]>(kIoBlockSize);
     for (;;)
     {
@@ -401,12 +207,29 @@ std::optional<std::string> My::File::fileCrc32(std::string_view filename)
             return std::nullopt;
         if (r == 0)
             break;
-        crc = Crc32Update(crc, buffer.get(), static_cast<size_t>(r));
+        hasher.update(buffer.get(), static_cast<size_t>(r));
     }
-    return Hex32(crc);
+    return hasher.finalize();
 }
 
-// ==================== fileXxHash64 ====================
+std::optional<std::string> My::File::fileCrc32(std::string_view filename)
+{
+    Fd fd(OpenRead(ToPath(filename)));
+    if (!fd)
+        return std::nullopt;
+    My::Hasher hasher(My::Hasher::Algorithm::Crc32);
+    const auto buffer = std::make_unique<char[]>(kIoBlockSize);
+    for (;;)
+    {
+        const auto r = ReadFd(fd.get(), buffer.get(), kIoBlockSize);
+        if (r < 0)
+            return std::nullopt;
+        if (r == 0)
+            break;
+        hasher.update(buffer.get(), static_cast<size_t>(r));
+    }
+    return hasher.finalize();
+}
 
 std::optional<std::string> My::File::fileXxHash64(std::string_view filename)
 {

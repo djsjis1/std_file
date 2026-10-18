@@ -189,3 +189,53 @@ bool My::File::deleteLines(std::string_view filename, size_t startLine, size_t e
     }
     return RewriteRange(path, *startPos, *endPos, std::string_view{}, "deleteLines", filename);
 }
+
+// ==================== 替换行方法 ====================
+
+bool My::File::replaceLine(std::string_view filename, size_t lineNumber, std::string_view newContent)
+{
+    if (lineNumber == 0) { PrintError("replaceLine", filename, "行号必须从1开始"); return false; }
+    const std::filesystem::path path = ToPath(filename);
+    std::optional<std::uintmax_t> startPos, endPos;
+    {
+        Fd in(OpenRead(path));
+        if (!in) { PrintError("replaceLine", filename, "无法打开文件"); return false; }
+        const auto fileSize = FdSize(in.get());
+        if (!fileSize) { PrintError("replaceLine", filename, "无法获取文件大小"); return false; }
+        startPos = FindLineStartFd(in.get(), lineNumber);
+        // startPos 为 nullopt（行号超出或 IO 错误）或指向 EOF（尾 \n 后无实际行）均视为越界
+        if (!startPos || *startPos >= *fileSize)
+        {
+            PrintError("replaceLine", filename, "行号超出范围");
+            return false;
+        }
+        endPos = FindLineStartFd(in.get(), lineNumber + 1);
+        if (!endPos)
+        {
+            // 下一行不存在，替换到文件末尾
+            endPos = fileSize;
+        }
+    }
+    // 构造替换内容：新内容 + 换行符（如果原行有换行）
+    std::string replacement(newContent);
+    if (*endPos > *startPos)
+    {
+        // 检查原行是否以 \n 结尾
+        Fd in(OpenRead(path));
+        if (!in) { PrintError("replaceLine", filename, "无法打开文件"); return false; }
+        if (!SeekFd(in.get(), static_cast<long long>(*endPos - 1)))
+        {
+            PrintError("replaceLine", filename, "定位失败");
+            return false;
+        }
+        char lastChar = 0;
+        if (ReadFd(in.get(), &lastChar, 1) != 1)
+        {
+            PrintError("replaceLine", filename, "读取失败");
+            return false;
+        }
+        if (lastChar == '\n')
+            replacement += '\n';
+    }
+    return RewriteRange(path, *startPos, *endPos, replacement, "replaceLine", filename);
+}

@@ -580,6 +580,63 @@ namespace
         EXPECT_FALSE(My::File::deleteLines(P("d.txt"), 1, 99));
     }
 
+    TEST_F(FileTest, ReplaceLine)
+    {
+        // 基本替换：中间行
+        WriteOk("r.txt", "aaa\nbbb\nccc\n");
+        ASSERT_TRUE(My::File::replaceLine(P("r.txt"), 2, "BBB"));
+        EXPECT_EQ(*My::File::readall(P("r.txt")), "aaa\nBBB\nccc\n");
+
+        // 替换首行
+        ASSERT_TRUE(My::File::replaceLine(P("r.txt"), 1, "AAA"));
+        EXPECT_EQ(*My::File::readall(P("r.txt")), "AAA\nBBB\nccc\n");
+
+        // 替换尾行（有尾换行）
+        ASSERT_TRUE(My::File::replaceLine(P("r.txt"), 3, "CCC"));
+        EXPECT_EQ(*My::File::readall(P("r.txt")), "AAA\nBBB\nCCC\n");
+
+        // 无尾换行文件的最后一行
+        WriteOk("r2.txt", "x\ny\nz");
+        ASSERT_TRUE(My::File::replaceLine(P("r2.txt"), 3, "Z"));
+        EXPECT_EQ(*My::File::readall(P("r2.txt")), "x\ny\nZ");
+
+        // 无尾换行文件的中间行
+        WriteOk("r3.txt", "1\n2\n3");
+        ASSERT_TRUE(My::File::replaceLine(P("r3.txt"), 2, "TWO"));
+        EXPECT_EQ(*My::File::readall(P("r3.txt")), "1\nTWO\n3");
+
+        // 单行文件
+        WriteOk("r4.txt", "only");
+        ASSERT_TRUE(My::File::replaceLine(P("r4.txt"), 1, "replaced"));
+        EXPECT_EQ(*My::File::readall(P("r4.txt")), "replaced");
+
+        // 单行带换行
+        WriteOk("r5.txt", "only\n");
+        ASSERT_TRUE(My::File::replaceLine(P("r5.txt"), 1, "replaced"));
+        EXPECT_EQ(*My::File::readall(P("r5.txt")), "replaced\n");
+
+        // 空内容替换（等于清空行但保留换行）
+        WriteOk("r6.txt", "a\nb\nc\n");
+        ASSERT_TRUE(My::File::replaceLine(P("r6.txt"), 2, ""));
+        EXPECT_EQ(*My::File::readall(P("r6.txt")), "a\n\nc\n");
+
+        // 错误: 行号 0
+        EXPECT_FALSE(My::File::replaceLine(P("r.txt"), 0, "z"));
+
+        // 错误: 行号超出范围
+        EXPECT_FALSE(My::File::replaceLine(P("r.txt"), 99, "z"));
+
+        // 错误: 空文件替换第 1 行
+        WriteOk("r7.txt", "");
+        EXPECT_FALSE(My::File::replaceLine(P("r7.txt"), 1, "z"));
+        EXPECT_EQ(*My::File::readall(P("r7.txt")), "");
+
+        // 错误: 尾换行文件的第 lineCount+1 行（不应成功追加）
+        WriteOk("r8.txt", "a\n");
+        EXPECT_FALSE(My::File::replaceLine(P("r8.txt"), 2, "z"));
+        EXPECT_EQ(*My::File::readall(P("r8.txt")), "a\n");
+    }
+
     // ==================== 平台相关 ====================
 
     TEST_F(FileTest, ChinesePathUtf8)

@@ -1,0 +1,18 @@
+# ============================================================
+# MyFile CMake Package Config
+#
+# 供 find_package(MyFile CONFIG REQUIRED) 使用
+# 本文件由 CMakePackageConfigHelpers  configure_file() 生成
+# ============================================================
+
+@PACKAGE_INIT@
+
+# 查找 MyFile 的依赖项(Threads)
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+# 导入导出的目标(MyFile::MyFile)
+include("${CMAKE_CURRENT_LIST_DIR}/MyFileTargets.cmake")
+
+# 检查请求的组件是否都可用
+check_required_components(MyFile)

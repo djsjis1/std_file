@@ -35,7 +35,7 @@ namespace My
         explicit LineIndex(std::string_view filename, size_t granularity = 1);
         size_t lineCount() const;
         std::optional<std::uintmax_t> lineStart(size_t lineNumber) const;
-        bool validate(std::string_view filename) const;
+        bool validate(std::string_view filename) const; // 注意：非线程安全，同一实例不可并发调用
         bool valid() const; // 构造是否成功（文件能打开且读取无错）
         size_t granularity() const { return granularity_; }
 
@@ -162,6 +162,7 @@ namespace My
         static bool copy(std::string_view src, std::string_view dest);
         // 大文件复制：内部委托 std::filesystem::copy_file（Windows 走 CopyFileW、Linux 走 copy_file_range，
         // 均优于用户态分块循环）；bufferSize 参数仅为接口兼容保留
+        [[deprecated("Use copy() instead; copyLarge is identical to copy since 1.0")]]
         static bool copyLarge(std::string_view src, std::string_view dest, size_t bufferSize = 64 * 1024);
         static bool createDirectory(std::string_view path);            // 创建目录
         static bool createDirectories(std::string_view path);          // 递归创建目录
@@ -215,6 +216,9 @@ namespace My
         // 删除指定行
         static bool deleteLine(std::string_view filename, size_t lineNumber);
         static bool deleteLines(std::string_view filename, size_t startLine, size_t endLine); // 删除连续多行
+
+        // 替换指定行的内容（保留换行符）
+        static bool replaceLine(std::string_view filename, size_t lineNumber, std::string_view newContent);
 
         // 使用行索引快速读取（O(log N) 定位 + 单次 seek+read）
         static std::optional<std::string> readLine(std::string_view filename, size_t lineNumber, const LineIndex &index);
